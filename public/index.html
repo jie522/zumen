@@ -845,6 +845,7 @@ async function showSheet(f, url, foot, drawing) {
 // 欄位依表格標題自動產生：含「日期」→ 日期選擇（預設今天）、含「人員」→ 記住上次填的名字、最後一欄 → 多行文字
 const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
 let rowCols = [];
+const DEFAULT_PERSON = '楊良捷';
 async function openRowForm() {
   const { f } = window._sheetFile;
   const body = document.querySelector('.sheet-wrap');
@@ -855,7 +856,8 @@ async function openRowForm() {
   try {
     const d = await api(`/api/sheet-form?type=${encodeURIComponent(f.type)}&id=${f.id}`);
     rowCols = d.columns;
-    let person = ''; try { person = localStorage.getItem('zm_person') || ''; } catch (_) {}
+    // 建立人員預設楊良捷；別人改填自己的名字後，那支手機之後就預設他的名字
+    let person = DEFAULT_PERSON; try { person = localStorage.getItem('zm_person') || DEFAULT_PERSON; } catch (_) {}
     form.innerHTML = `<div class="rf-h"><b>新增一筆</b><span>${esc(d.sheetName)} · 目前 ${d.rows} 筆</span>
         <button class="ibtn" onclick="this.closest('.row-form').remove()" aria-label="取消">${icon('x', 20)}</button></div>
       <div class="rf-body">${d.columns.map((c, i) => {
