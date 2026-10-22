@@ -342,6 +342,25 @@ app.get('/api/file-urls', async (req, res) => {
   res.json({ urls });
 });
 
+// 取檔案內容（手機上預覽 Excel/CSV 用）：GCS 簽章網址沒有 CORS 標頭，
+// 手機網頁不能直接 fetch，只好由伺服器代抓再轉給手機
+app.get('/api/file-content', async (req, res) => {
+  const type = String(req.query.type || 'drawing');
+  const id = String(req.query.id || '').replace(/\D/g, '');
+  if (!id) return res.status(400).json({ error: '缺少檔案 id' });
+  const kind = type === 'drawing' ? 'drawing_file' : 'document_file';
+  const result = await zumeAPI('GET', `/api/${kind}s/urls?${kind}_ids%5B%5D=${id}`);
+  const fileUrl = result.ok && (result.data[`${kind}_urls`] || [])[0]?.file_url;
+  if (!fileUrl) return res.status(502).json({ error: '無法取得檔案連結' });
+  try {
+    const r = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 30 * 1048576 });
+    res.set('Content-Type', 'application/octet-stream');
+    res.send(Buffer.from(r.data));
+  } catch (e) {
+    res.status(502).json({ error: '下載檔案失敗：' + extractErrorMessage(e) });
+  }
+});
+
 // ── 上傳（背景工作 + 輪詢）──────────────────────────────────
 // 手機上傳影片到 ZUMEN 可能要好幾分鐘，手機螢幕一關 HTTP 連線就斷；
 // 所以檔案收完就先回 jobId，後續由前端輪詢 /api/jobs/:id 看結果
@@ -351,22 +370,58 @@ setInterval(() => {
   for (const [k, j] of jobs) if (j.createdAt < cutoff) jobs.delete(k);
 }, 600000);
 
-async function uploadFileToTab(drawingId, type, filePath, sizeMB) {
+// ── 影片壓縮 ──────────────────────────────────────────────
+// 2026-10-22 實測：iPhone 1 分鐘 1080p .mov 約 60MB，公司對外上傳只有 ~230KB/s，
+// 光是電腦→ZUMEN 就要 4~5 分鐘以上。先在電腦轉成 720p H.264 MP4（約原本 1/4~1/6），
+// 上傳快很多，而且 Android 也播得了（iPhone 的 HEVC 很多 Android 不支援）
+const { spawn } = require('child_process');
+let ffmpegPath = null;
+try { ffmpegPath = require('ffmpeg-static'); } catch (_) {}
+const VIDEO_EXT = ['.mov', '.mp4', '.m4v', '.3gp', '.avi', '.mkv', '.wmv', '.mts', '.webm'];
+const COMPRESS_MIN_MB = 8;
+
+function compressVideo(input, onProgress) {
+  return new Promise((resolve, reject) => {
+    const out = input.replace(/\.[^.\\/]+$/, '') + '.mp4';
+    const target = out === input ? input.replace(/\.mp4$/i, '_720p.mp4') : out;
+    // 長邊縮到 1280（直式、橫式都適用），CRF 26 對加工影片畫質足夠；faststart 讓手機邊下載邊播
+    const args = ['-y', '-i', input,
+      '-vf', "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))'",
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', target];
+    const p = spawn(ffmpegPath, args, { windowsHide: true });
+    let duration = 0, errTail = '';
+    p.stderr.on('data', buf => {
+      const s = buf.toString();
+      errTail = (errTail + s).slice(-600);
+      const d = s.match(/Duration: (\d+):(\d+):([\d.]+)/);
+      if (d) duration = (+d[1]) * 3600 + (+d[2]) * 60 + parseFloat(d[3]);
+      const t = s.match(/time=(\d+):(\d+):([\d.]+)/);
+      if (t && duration) onProgress(Math.min(99, Math.round(((+t[1]) * 3600 + (+t[2]) * 60 + parseFloat(t[3])) / duration * 100)));
+    });
+    p.on('error', reject);
+    p.on('close', code => code === 0 ? resolve(target) : reject(new Error('影片壓縮失敗：' + errTail.split('\n').filter(Boolean).pop())));
+  });
+}
+
+async function uploadFileToTab(drawingId, type, filePath, sizeMB, log = () => {}) {
   if (!page || page.isClosed()) throw new Error('ZUMEN 尚未登入完成');
   const targetUrl = type === 'drawing'
     ? `https://zume-n.com/drawings/${drawingId}`
     : `https://zume-n.com/drawings/${drawingId}?documentTypeMasterId=${encodeURIComponent(type)}`;
+  log('取得現有檔案清單');
   const before = new Set((await listFilesAPI(drawingId, type)).map(f => f.id));
 
   await page.goto(targetUrl);
   await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1000);
+  log('ZUMEN 頁面已開啟');
 
   // 直接 setInputFiles 會被 ZUMEN 的 React 忽略：要觸發原生 click 產生 filechooser 再選檔；
   // 文件分頁每個面板都有自己的 input，必須挑可見面板的那一個
   const inputSel = type === 'drawing' ? 'input[type="file"]' : '.chakra-tabs__tab-panel:not([hidden]) input[type="file"]';
   const inputEl = await page.$(inputSel);
-  if (!inputEl) throw new Error('ZUMEN 頁面找不到上傳欄位');
+  if (!inputEl) { await dumpDebugState('upload_no_input'); throw new Error('ZUMEN 頁面找不到上傳欄位'); }
   const [chooser] = await Promise.all([
     page.waitForEvent('filechooser', { timeout: 10000 }),
     inputEl.evaluate(el => el.click())
@@ -381,16 +436,32 @@ async function uploadFileToTab(drawingId, type, filePath, sizeMB) {
   else {
     const alt = page.locator('div:has-text("選擇更多檔案") button[data-testid="submit-button"]').last();
     if (await alt.count()) await alt.click();
+    else { await dumpDebugState('upload_no_save_button'); throw new Error('ZUMEN 沒有出現「儲存」按鈕'); }
   }
+  log('已按下儲存，瀏覽器開始傳檔到 ZUMEN');
 
-  // ZUMEN 回應不可信，輪詢檔案清單直到新檔出現才算成功；大影片給比較長的時間
-  const deadline = Date.now() + Math.min(20 * 60000, 180000 + sizeMB * 4000);
+  // ZUMEN 回應不可信，輪詢檔案清單直到新檔出現才算成功。
+  // 逾時依檔案大小放寬：以實測對外上傳 ~200KB/s 估算（每 MB 約 6 秒）再乘兩倍保險
+  const deadline = Date.now() + Math.min(40 * 60000, 120000 + sizeMB * 12000);
   while (Date.now() < deadline) {
     await page.waitForTimeout(3000);
     const now = await listFilesAPI(drawingId, type).catch(() => []);
-    if (now.some(f => !before.has(f.id))) return true;
+    if (now.some(f => !before.has(f.id))) { log('ZUMEN 檔案清單已出現新檔'); return true; }
   }
+  await dumpDebugState('upload_timeout');
   return false;
+}
+
+// 失敗時存下 ZUMEN 頁面截圖，方便查到底卡在哪一步（debug/ 不進 git）
+async function dumpDebugState(label) {
+  try {
+    if (!page || page.isClosed()) return;
+    const dir = path.join(__dirname, 'debug');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const base = path.join(dir, `${label}_${new Date().toISOString().replace(/[:.]/g, '-')}`);
+    await page.screenshot({ path: base + '.png', fullPage: true }).catch(() => {});
+    console.log(`[除錯] 已存失敗畫面：${base}.png`);
+  } catch (_) {}
 }
 
 app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
@@ -402,23 +473,50 @@ app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
   jobs.set(jobId, job);
   res.json({ jobId });
 
-  const sizeMB = req.file.size / 1048576;
-  withPage(async () => {
-    job.state = 'uploading';
-    job.message = '正在上傳到 ZUMEN…';
-    try {
-      const ok = await uploadFileToTab(drawingId, type, req.file.path, sizeMB);
-      job.state = ok ? 'done' : 'error';
-      job.message = ok ? '上傳完成' : '上傳逾時，請稍後到 ZUMEN 確認檔案是否出現';
-    } catch (e) {
-      job.state = 'error';
-      job.message = e.message.slice(0, 200);
-    } finally {
-      cleanupUpload(req.file);
-      console.log(`[上傳] ${job.name} → drawings/${drawingId} (${type}) ${job.state}`);
+  const t0 = Date.now();
+  const sec = () => Math.round((Date.now() - t0) / 1000);
+  const log = step => console.log(`[上傳 ${jobId}] ${sec()}s ${step}`);
+  const extra = [];   // 壓縮後產生的檔案，結束時一併清掉
+  (async () => {
+    let filePath = req.file.path;
+    let sizeMB = req.file.size / 1048576;
+    log(`收到 ${job.name}（${sizeMB.toFixed(1)}MB）`);
+    // 影片且夠大才壓縮；壓完沒變小（本來就很省）就用原檔
+    if (ffmpegPath && VIDEO_EXT.includes(path.extname(filePath).toLowerCase()) && sizeMB >= COMPRESS_MIN_MB) {
+      job.state = 'compressing';
+      job.message = '壓縮影片中…';
+      try {
+        const out = await compressVideo(filePath, pct => { job.message = `壓縮影片中 ${pct}%`; });
+        extra.push(out);
+        const outMB = fs.statSync(out).size / 1048576;
+        log(`壓縮完成 ${sizeMB.toFixed(1)}MB → ${outMB.toFixed(1)}MB`);
+        if (outMB < sizeMB * 0.9) { filePath = out; sizeMB = outMB; job.name = path.basename(out); }
+      } catch (e) {
+        log('壓縮失敗，改傳原檔：' + e.message.slice(0, 150));
+      }
     }
-  });
+    job.state = 'queued';
+    job.message = '排隊中…';
+    await withPage(async () => {
+      job.state = 'uploading';
+      job.message = `上傳到 ZUMEN 中（${sizeMB.toFixed(1)}MB）…`;
+      try {
+        const ok = await uploadFileToTab(drawingId, type, filePath, sizeMB, log);
+        job.state = ok ? 'done' : 'error';
+        job.message = ok ? '上傳完成' : '上傳逾時，請稍後到 ZUMEN 確認檔案是否出現';
+      } catch (e) {
+        job.state = 'error';
+        job.message = e.message.slice(0, 200);
+      }
+    });
+  })().catch(e => { job.state = 'error'; job.message = e.message.slice(0, 200); })
+    .finally(() => {
+      for (const f of extra) { try { fs.unlinkSync(f); } catch (_) {} }
+      cleanupUpload(req.file);
+      log(`結束：${job.state} ${job.message}`);
+    });
 });
+
 
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);

@@ -238,6 +238,21 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 .vmsg .big{width:72px;height:72px;border-radius:20px;background:rgba(255,255,255,.08);display:grid;place-items:center;margin:0 auto 16px;font-family:var(--mono);font-weight:700;text-transform:uppercase;color:#fff}
 .vmsg a{display:inline-flex;align-items:center;gap:8px;margin-top:18px;background:#fff;color:var(--ink);text-decoration:none;font-weight:700;padding:12px 22px;border-radius:14px}
 .vfoot{padding:10px 16px calc(var(--safe-b) + 12px);color:#8FA0B2;font-size:12px;text-align:center}
+/* 表格預覽（白底，可上下左右捲動） */
+.sheet-wrap{position:absolute;inset:0;background:#fff;display:flex;flex-direction:column}
+.sh-tabs{flex-shrink:0;display:flex;gap:6px;overflow-x:auto;padding:8px 10px;background:#EEF2F6;scrollbar-width:none}
+.sh-tabs button{flex-shrink:0;padding:6px 12px;border-radius:8px;background:#fff;color:var(--ink-2);font-size:13px;font-weight:500}
+.sh-tabs button.on{background:var(--brand);color:#fff}
+.sh-body{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;padding:10px}
+.sh-body table{border-collapse:collapse;min-width:100%;font-size:13.5px;color:var(--ink)}
+.sh-body td,.sh-body th{border:1px solid #CFD8DC;padding:7px 10px;white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+.sh-body tr.hd td{background:#E8F5E9;font-weight:700;text-align:center}
+.sh-body tr:nth-child(even) td{background:#FAFBFC}
+/* 文件第一頁預覽 */
+.pv-doc{position:absolute;inset:0;overflow:auto;display:flex;flex-direction:column;align-items:center;padding:12px 12px 20px;gap:12px}
+.pv-doc img{width:100%;max-width:640px;background:#fff;border-radius:6px}
+.pv-cap{color:#8FA0B2;font-size:12.5px}
+.pv-open{display:inline-flex;align-items:center;gap:8px;background:#fff;color:var(--ink);text-decoration:none;font-weight:700;padding:12px 22px;border-radius:14px}
 .vgo{margin-top:10px;width:100%;min-height:46px;border-radius:14px;background:rgba(255,255,255,.1);color:#fff;font-size:14px;font-weight:700;padding:8px 14px;display:flex;align-items:center;justify-content:center;gap:6px}
 .vgo span{font-family:var(--mono);color:#90CAF9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
@@ -755,24 +770,72 @@ async function openFileObj(f, drawing = null) {
   showViewer(f.name, '<div class="spin" style="border-color:rgba(255,255,255,.2);border-top-color:#fff"></div>', '', '', drawing);
   try {
     const { urls } = await api(`/api/file-urls?type=${encodeURIComponent(type)}&ids=${id}`);
-    const url = urls[0]?.url;
+    const url = urls[0]?.url, thumb = urls[0]?.thumbnail_url;
     if (!url) throw new Error('取不到檔案連結');
-    // 檔案搜尋的結果沒有副檔名欄位，從檔案網址（.../xxxx.mov?簽章）補
-    if (!f.extension) f.extension = (url.split('?')[0].match(/\.([a-z0-9]{2,5})$/i)?.[1] || '').toLowerCase();
+    // 檔案搜尋的結果沒有副檔名欄位，從檔案網址（.../xxxx.mov?簽章）補；縮圖網址是 .webp 不能拿來判斷
+    if (!f.extension && url !== thumb) f.extension = (url.split('?')[0].match(/\.([a-z0-9]{2,5})$/i)?.[1] || '').toLowerCase();
     const e = f.extension, foot = [fmtDate(f.created_at), f.account, drawing ? typeName(type) : ''].filter(Boolean).join(' · ');
     if (PLAYABLE.includes(e)) {
       showViewer(f.name, `<video src="${esc(url)}" controls autoplay playsinline preload="auto"
         onerror="this.outerHTML=noPlayHtml('${esc(e)}','${esc(url)}')"></video>`, url, foot, drawing);
     } else if (IMAGE_EXT.includes(e) && e !== 'heic') {
       showViewer(f.name, `<img src="${esc(url)}" alt="">`, url, foot + ' · 可用兩指縮放', drawing);
+    } else if (SHEET_EXT.includes(e)) {
+      showViewer(f.name, `<div class="vmsg">${spinHtml}<br>讀取表格中…</div>`, url, foot, drawing);
+      await showSheet(f, url, foot, drawing);
     } else {
-      const label = e === 'pdf' ? '開啟 PDF' : isVideo(f) ? '下載影片' : '開啟檔案';
-      showViewer(f.name, `<div class="vmsg"><div class="big">${esc(e || '?')}</div>${e === 'pdf' ? '用手機內建的 PDF 檢視器開啟，<br>可以縮放與翻頁' : '這種檔案無法在網頁上直接預覽'}<br>
-        <a href="${esc(url)}" target="_blank" rel="noopener">${icon('ext', 18)}${label}</a></div>`, url, foot, drawing);
+      // 其它格式：先放 ZUMEN 產生的第一頁預覽圖，再給開啟原檔的按鈕
+      const label = e === 'pdf' ? '開啟完整 PDF' : isVideo(f) ? '下載影片' : '開啟檔案';
+      const hint = e === 'pdf' ? '用手機內建的 PDF 檢視器看全部頁面' : '完整內容請開啟原檔';
+      showViewer(f.name, thumb
+        ? `<div class="pv-doc"><img src="${esc(thumb)}" alt=""><div class="pv-cap">第 1 頁預覽 · ${hint}</div>
+           <a class="pv-open" href="${esc(url)}" target="_blank" rel="noopener">${icon('ext', 18)}${label}</a></div>`
+        : `<div class="vmsg"><div class="big">${esc(e || '?')}</div>${hint}<br>
+           <a href="${esc(url)}" target="_blank" rel="noopener">${icon('ext', 18)}${label}</a></div>`, url, foot, drawing);
     }
   } catch (err) {
     showViewer(f.name, `<div class="vmsg"><div class="big">!</div>${esc(err.message)}</div>`, '', '', drawing);
   }
+}
+/* ── Excel / CSV 預覽：跟 ZUMEN 網頁一樣在瀏覽器裡把表格畫出來 ── */
+const SHEET_EXT = ['xlsx', 'xls', 'xlsm', 'csv'];
+const spinHtml = '<span class="spin" style="display:inline-block;border-color:rgba(255,255,255,.2);border-top-color:#fff"></span>';
+let xlsxLib = null;
+function loadXlsx() {
+  return xlsxLib ||= new Promise((ok, fail) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload = () => ok(window.XLSX);
+    s.onerror = () => { xlsxLib = null; fail(new Error('表格元件載入失敗，請確認手機有網路')); };
+    document.head.appendChild(s);
+  });
+}
+async function showSheet(f, url, foot, drawing) {
+  try {
+    const [XLSX, buf] = await Promise.all([loadXlsx(), fetch(`/api/file-content?type=${encodeURIComponent(f.type)}&id=${f.id}`, { headers: { 'x-pin': PIN } })
+      .then(async r => { if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || '下載失敗'); return r.arrayBuffer(); })]);
+    const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+    const sheets = wb.SheetNames.map(n => ({ n, html: tidySheet(XLSX.utils.sheet_to_html(wb.Sheets[n], { header: '', footer: '' })) }));
+    if (!$('viewer').classList.contains('show')) return;
+    const tabs = sheets.length > 1 ? `<div class="sh-tabs">${sheets.map((s, i) => `<button class="${i ? '' : 'on'}" onclick="pickSheet(${i}, this)">${esc(s.n)}</button>`).join('')}</div>` : '';
+    window._sheets = sheets;
+    showViewer(f.name, `<div class="sheet-wrap">${tabs}<div class="sh-body" id="shBody">${sheets[0]?.html || '（空白表格）'}</div></div>`, url, foot + ' · 左右滑動看更多欄', drawing);
+  } catch (err) {
+    showViewer(f.name, `<div class="vmsg"><div class="big">${esc(f.extension)}</div>表格預覽失敗：${esc(err.message)}<br>
+      <a href="${esc(url)}" target="_blank" rel="noopener">${icon('ext', 18)}開啟原檔</a></div>`, url, foot, drawing);
+  }
+}
+// 範本表格常留很多空白列（例如生產履歷預留填寫格），手機上全部拿掉；第一個有字的列當表頭
+function tidySheet(html) {
+  const box = document.createElement('div');
+  box.innerHTML = html;
+  box.querySelectorAll('tr').forEach(tr => { if (!tr.textContent.trim()) tr.remove(); });
+  box.querySelector('tr')?.classList.add('hd');
+  return box.querySelector('tr') ? box.innerHTML : '';
+}
+function pickSheet(i, btn) {
+  document.querySelectorAll('.sh-tabs button').forEach(b => b.classList.toggle('on', b === btn));
+  $('shBody').innerHTML = window._sheets[i].html; $('shBody').scrollTo(0, 0);
 }
 function noPlayHtml(ext, url) {
   return `<div class="vmsg"><div class="big">${ext}</div>這支影片的格式手機無法直接播放<br>（iPhone 錄的 HEVC 影片在部分 Android 手機上會這樣）
@@ -887,7 +950,8 @@ function renderJobs() {
   $('jobsPill').classList.toggle('hidden', !active.length);
   if (active.length) {
     const j = active[0];
-    $('jobsTxt').textContent = j.phase === 'send' ? `傳送中 ${j.pct}%` : `ZUMEN 處理中${active.length > 1 ? `（${active.length} 個）` : ''}`;
+    $('jobsTxt').textContent = (j.phase === 'send' ? `傳送到電腦 ${j.pct}%` : (j.msg || 'ZUMEN 處理中').replace(/（[\d.]+MB）/, ''))
+      + (active.length > 1 ? `（共 ${active.length} 個）` : '');
   }
   if ($('jobList')) $('jobList').innerHTML = jobsHtml();
 }
