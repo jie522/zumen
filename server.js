@@ -244,6 +244,34 @@ app.get('/api/drawings/:id', async (req, res) => {
   });
 });
 
+// ── 檔案搜尋（ZUMEN 網頁搜尋結果的「檔案」選項）────────────
+// 回應的每筆是 { drawing_file: {...} } 或 { document_file: {..., document: { document_type_master_id, drawing }} }；
+// 沒有 extension 欄位、name 也不一定帶副檔名，副檔名改由前端從取檔網址判斷（2026-10-22 實測）
+app.get('/api/files/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const pg = Number(req.query.page) || 1;
+  if (!q) return res.json({ files: [], last_page: 1, page: 1 });
+  const result = await zumeAPI('GET', `/api/drawing_and_document_files/freeword_search?query=${encodeURIComponent(q)}&page=${pg}&sort%5Btype%5D=score_desc`);
+  if (!result.ok) return res.status(502).json({ error: result.error || '搜尋失敗' });
+  const files = (result.data.files || []).map(x => {
+    const f = x.drawing_file || x.document_file;
+    if (!f) return null;
+    const drawing = x.drawing_file ? f.drawing : f.document?.drawing;
+    const name = f.name || '';
+    const m = name.match(/\.([a-z0-9]{2,5})$/i);
+    return {
+      id: f.id,
+      type: x.drawing_file ? 'drawing' : (f.document?.document_type_master_id || ''),
+      name,
+      extension: m ? m[1].toLowerCase() : '',
+      thumbnail_url: f.thumbnail_url || '',
+      created_at: f.created_at || '',
+      drawing: drawing ? { id: drawing.id, drawing_number: getBasicOf(drawing, 'drawing_number'), product_name: getBasicOf(drawing, 'product_name') } : null
+    };
+  }).filter(Boolean);
+  res.json({ files, last_page: result.data.total_pages || 1, page: pg });
+});
+
 // ── 文件分類 ──────────────────────────────────────────────
 let docTypesCache = null;
 async function getDocTypes() {
