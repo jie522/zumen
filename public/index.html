@@ -71,6 +71,20 @@ svg{display:block}
 .pname{font-size:15px;font-weight:500;margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .meta{font-size:12px;color:var(--ink-3);margin-top:4px}
 .chev{color:#C5CFD9;flex-shrink:0}
+/* 預覽模式：比照 ZUMEN 網頁的大圖卡片，手機上兩欄 */
+.list.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.grid .item{flex-direction:column;align-items:stretch;gap:0;padding:0;overflow:hidden;border:1px solid var(--line)}
+.grid .thumb{width:100%;height:auto;aspect-ratio:1/1;border-radius:0;border:none;border-bottom:1px solid var(--line-2);background:#fff}
+.grid .thumb img{padding:6px}
+.grid .info{padding:9px 10px 11px}
+.grid .dno{font-size:12.5px;color:var(--ink);letter-spacing:0}
+.grid .pname{font-size:13.5px;font-weight:400;color:var(--ink-2)}
+.grid .meta,.grid .chev{display:none}
+.grid .empty{grid-column:1/-1}
+.vtog{display:flex;background:#fff;border-radius:10px;padding:3px;margin-left:8px;box-shadow:0 1px 2px rgba(16,32,44,.06)}
+.vtog button{width:34px;height:28px;border-radius:7px;display:grid;place-items:center;color:var(--ink-3)}
+.vtog button.on{background:var(--brand-l);color:var(--brand)}
+@media(min-width:560px){.list.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 .more{padding:22px;text-align:center;color:var(--ink-3);font-size:13px}
 .empty{padding:60px 20px;text-align:center;color:var(--ink-3)}
@@ -257,6 +271,8 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
   <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 8v5m0 3.5v.5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></symbol>
   <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 3h8l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
   <symbol id="i-zoom" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="4" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+  <symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><rect x="5" y="4" width="22" height="24" rx="3" fill="none" stroke="#0D47A1" stroke-width="2.6"/><path d="M10 11h12M10 16h12M10 21h7" stroke="#0D47A1" stroke-width="2.6" stroke-linecap="round"/><circle cx="23.5" cy="22.5" r="4.5" fill="#FF8F00"/></symbol>
 </svg>
 
@@ -284,7 +300,12 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
     <div class="sec-t">最近看過</div>
     <div class="recent" id="recent"></div>
   </section>
-  <div class="sec-t"><span id="listTitle">最新更新</span><span class="cnt" id="listCnt"></span></div>
+  <div class="sec-t"><span id="listTitle">最新更新</span><span class="cnt" id="listCnt"></span>
+    <div class="vtog">
+      <button id="vtGrid" onclick="setMode('grid')" aria-label="預覽"><svg width="18" height="18"><use href="#i-grid"/></svg></button>
+      <button id="vtList" onclick="setMode('list')" aria-label="清單"><svg width="18" height="18"><use href="#i-rows"/></svg></button>
+    </div>
+  </div>
   <div class="list" id="list"></div>
   <div class="more" id="more"></div>
 </main>
@@ -406,6 +427,17 @@ $('q').addEventListener('input', e => {
 });
 $('q').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(qT); search(e.target.value.trim()); e.target.blur(); } });
 $('qx').onclick = () => { $('q').value = ''; $('qx').classList.add('hidden'); search(''); $('q').focus(); };
+
+// 預覽（大圖兩欄，預設）/ 清單（小圖一列一筆），記在手機上
+function setMode(m) {
+  try { localStorage.setItem('zm_mode', m); } catch (_) {}
+  $('list').classList.toggle('grid', m === 'grid');
+  $('vtGrid').classList.toggle('on', m === 'grid');
+  $('vtList').classList.toggle('on', m !== 'grid');
+}
+let initMode = 'grid';
+try { initMode = localStorage.getItem('zm_mode') || 'grid'; } catch (_) {}
+setMode(initMode);
 
 function skeleton(n = 6) {
   return Array.from({ length: n }, () => `<div class="item"><div class="thumb sk"></div><div class="info">
