@@ -50,6 +50,25 @@ node server.js
 
 連不上時：確認手機跟電腦在同一個網路；Windows 防火牆第一次跳出詢問時要按「允許」（或手動開放 TCP 3457）。
 
+## 在外面也能用（Tailscale）
+
+ZUMEN 只接受從 zume-n.com 自己網站發出的呼叫，所以手機版一定要透過公司這台電腦轉接。
+用 [Tailscale](https://tailscale.com) 在電腦和手機之間建一條私人通道，手機用 4G/5G 或在家也能連回來；
+不會產生公開網址，外人連不到，也**不需要改公司防火牆**。免費版可連 100 台裝置。
+
+**電腦（只要做一次）**
+1. 到 https://tailscale.com/download/windows 下載安裝（需要系統管理員權限）
+2. 右下角 Tailscale 圖示 → Log in，用 Google 或 Microsoft 帳號登入
+3. 重新啟動手機版伺服器，開 `http://localhost:3457/connect.html` →「外出（Tailscale）」分頁會出現 `http://100.x.x.x:3457` 的 QR Code
+
+**每支手機**
+1. App Store / Google Play 安裝「Tailscale」
+2. 登入**跟電腦同一個帳號**（同事要用時，在 Tailscale 管理頁 Users → Invite 邀請他們）
+3. 打開 Tailscale 確認已連線，掃描「外出」分頁的 QR Code，再「加入主畫面」
+
+注意：公司電腦要一直開著、不能睡眠（Windows 設定 → 電源 → 睡眠改「永不」）。
+安裝 Tailscale 前建議先知會公司 IT。
+
 ## 設定（.env）
 
 | 變數 | 說明 |

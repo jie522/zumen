@@ -399,13 +399,20 @@ app.get('/api/jobs/:id', (req, res) => {
 });
 
 // ── 啟動 ──────────────────────────────────────────────────
+// Tailscale 給每台裝置一個 100.64.0.0/10 的固定位址，手機裝 Tailscale 後在外面也連得到這個位址
+const isTailscaleIp = ip => { const [a, b] = ip.split('.').map(Number); return a === 100 && b >= 64 && b <= 127; };
 function lanAddresses() {
   return Object.values(os.networkInterfaces()).flat()
     .filter(n => n && n.family === 'IPv4' && !n.internal)
     .map(n => n.address);
 }
 app.get('/api/connect-info', (req, res) => {
-  res.json({ urls: lanAddresses().map(ip => `http://${ip}:${PORT}`), pin: !!ACCESS_PIN });
+  const ips = lanAddresses();
+  res.json({
+    lan: ips.filter(ip => !isTailscaleIp(ip)).map(ip => `http://${ip}:${PORT}`),
+    tailscale: ips.filter(isTailscaleIp).map(ip => `http://${ip}:${PORT}`),
+    pin: !!ACCESS_PIN
+  });
 });
 
 process.on('exit', () => { if (browser) browser.close().catch(() => {}); });
@@ -413,7 +420,9 @@ process.on('exit', () => { if (browser) browser.close().catch(() => {}); });
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`📱 ZUMEN 手機版已啟動`);
   console.log(`   本機：http://localhost:${PORT}`);
-  lanAddresses().forEach(ip => console.log(`   手機（同一個 Wi-Fi）：http://${ip}:${PORT}`));
+  lanAddresses().forEach(ip => console.log(isTailscaleIp(ip)
+    ? `   手機（外出，Tailscale）：http://${ip}:${PORT}`
+    : `   手機（同一個 Wi-Fi）：http://${ip}:${PORT}`));
   console.log(`   電腦開 http://localhost:${PORT}/connect.html 可顯示 QR Code 給手機掃`);
   console.log('🚀 登入 ZUMEN 中…');
   doAutoLogin().catch(e => console.error('❌ 自動登入失敗:', e.message));
