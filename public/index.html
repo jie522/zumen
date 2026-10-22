@@ -313,7 +313,7 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 <!-- 詳細頁 -->
 <section class="view" id="view">
   <div class="bar" id="bar">
-    <button class="ibtn" onclick="history.back()" aria-label="返回"><svg width="24" height="24"><use href="#i-back"/></svg></button>
+    <button class="ibtn" onclick="goBack()" aria-label="返回"><svg width="24" height="24"><use href="#i-back"/></svg></button>
     <div class="bt" id="barTitle"></div>
   </div>
   <div class="det" id="det"></div>
@@ -322,13 +322,13 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 <button class="jobs-pill hidden" id="jobsPill" onclick="openJobs()"><span class="spin"></span><span id="jobsTxt"></span></button>
 
 <!-- 上傳面板 -->
-<div class="scrim" id="scrim" onclick="history.back()"></div>
+<div class="scrim" id="scrim" onclick="goBack()"></div>
 <div class="sheet" id="sheet"></div>
 
 <!-- 檔案檢視器 -->
 <div class="viewer" id="viewer">
   <div class="vbar">
-    <button class="ibtn" onclick="history.back()" aria-label="關閉"><svg width="24" height="24"><use href="#i-x"/></svg></button>
+    <button class="ibtn" onclick="goBack()" aria-label="關閉"><svg width="24" height="24"><use href="#i-x"/></svg></button>
     <div class="vt" id="vTitle"></div>
     <a class="ibtn" id="vOpen" target="_blank" rel="noopener" aria-label="開啟原檔" style="color:#fff"><svg width="22" height="22"><use href="#i-ext"/></svg></a>
   </div>
@@ -525,7 +525,20 @@ function route() {
   }
 }
 window.addEventListener('hashchange', route);
-window.addEventListener('popstate', () => { if (!location.hash.includes('~')) closeOverlays(); });
+// iOS（尤其「加入主畫面」後）返回時有時只發 popstate、不發 hashchange，兩個都接
+window.addEventListener('popstate', route);
+// 畫面上的「返回／關閉」不能只靠 history.back()：從主畫面圖示直接開在圖面頁時沒有上一頁，
+// iPhone 主畫面模式也沒有瀏覽器的返回鍵。退不回去時就直接改網址回上一層
+function goBack() {
+  const before = location.hash;
+  history.back();
+  setTimeout(() => {
+    if (location.hash !== before) return;
+    const up = before.includes('~') ? before.split('~')[0] : '';
+    history.replaceState(null, '', up || location.pathname + location.search);
+    route();
+  }, 350);
+}
 function pushOverlay(name) { history.pushState(null, '', (location.hash.split('~')[0] || '#') + '~' + name); }
 function closeOverlays() {
   if (location.hash.includes('~')) return;
@@ -753,7 +766,7 @@ function startUpload() {
     jobs.push(job); sendJob(job, name);
   });
   U.files = [];
-  history.back();
+  goBack();
   toast('已開始上傳，可以繼續瀏覽', 'ok');
   renderJobs();
 }
@@ -816,7 +829,7 @@ function openJobs() {
   $('sheet').innerHTML = `<div class="grab"></div><h3>上傳進度</h3>
     <div style="font-size:13px;color:var(--ink-3);margin-top:4px">「ZUMEN 處理中」時可以關掉這個畫面；傳送到電腦的階段請勿關閉網頁</div>
     <div id="jobList" style="margin-top:8px">${jobsHtml()}</div>
-    <button class="bigbtn ghost" onclick="history.back()">關閉</button>`;
+    <button class="bigbtn ghost" onclick="goBack()">關閉</button>`;
   pushOverlay('j');
   $('scrim').classList.add('show'); $('sheet').classList.add('show');
 }
@@ -824,6 +837,12 @@ window.addEventListener('beforeunload', e => { if (jobs.some(j => j.phase === 's
 
 // 重新整理時若停在 overlay 狀態，先回到乾淨的 hash
 if (location.hash.includes('~')) history.replaceState(null, '', location.hash.split('~')[0]);
+// 直接開在圖面頁（主畫面圖示、重新整理）時，底下補一層首頁，讓手機的返回手勢也能回首頁
+if (location.hash.startsWith('#d=')) {
+  const h = location.hash;
+  history.replaceState(null, '', location.pathname + location.search);
+  history.pushState(null, '', h);
+}
 boot();
 </script>
 </body>
