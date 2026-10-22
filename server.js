@@ -371,9 +371,10 @@ setInterval(() => {
 }, 600000);
 
 // ── 影片壓縮 ──────────────────────────────────────────────
-// 2026-10-22 實測：iPhone 1 分鐘 1080p .mov 約 60MB，公司對外上傳只有 ~230KB/s，
-// 光是電腦→ZUMEN 就要 4~5 分鐘以上。先在電腦轉成 720p H.264 MP4（約原本 1/4~1/6），
-// 上傳快很多，而且 Android 也播得了（iPhone 的 HEVC 很多 Android 不支援）
+// iPhone 1 分鐘 1080p .mov 約 60MB。先在電腦轉成 720p H.264 MP4（約原本 1/4~1/6）：
+// ZUMEN 空間省、手機看的時候載入快，而且 Android 也播得了（iPhone 的 HEVC 很多 Android 不支援）。
+// （2026-10-22 一度以為公司對外頻寬只有 230KB/s 才導致上傳失敗，後來實測 20MB 4 秒就傳完，
+//   真正原因是「儲存」被 ZUMEN 忽略，見 uploadFileToTab）
 const { spawn } = require('child_process');
 let ffmpegPath = null;
 try { ffmpegPath = require('ffmpeg-static'); } catch (_) {}
@@ -431,18 +432,33 @@ async function uploadFileToTab(drawingId, type, filePath, sizeMB, log = () => {}
 
   // 選檔後跳出「N個文件已新增」對話框，一定要按裡面的「儲存」才會真的上傳。
   // 用 data-testid 定位，文字比對會誤中 disabled 的「儲存為組圖」按鈕
-  const saveBtn = page.locator('[role="dialog"]:has-text("已新增") button[data-testid="submit-button"], .chakra-modal__content:has-text("已新增") button[data-testid="submit-button"]').first();
-  if (await saveBtn.count()) await saveBtn.click();
-  else {
-    const alt = page.locator('div:has-text("選擇更多檔案") button[data-testid="submit-button"]').last();
-    if (await alt.count()) await alt.click();
-    else { await dumpDebugState('upload_no_save_button'); throw new Error('ZUMEN 沒有出現「儲存」按鈕'); }
+  //
+  // 2026-10-22 踩雷：手機傳來的大影片，選檔後 1.5 秒就按「儲存」會被 ZUMEN 無聲忽略
+  // （對話框還在處理剛選的檔案），之後沒人再按，就一直等到逾時——除錯截圖裡對話框原封不動。
+  // 實測按下有效時：按鈕立刻變轉圈圈（disabled）→ 傳到 GCS → 對話框關閉。
+  // 所以改成「按了要確認有被接受」：對話框還在、按鈕又沒在轉，就再按一次。
+  // 按鈕轉圈時是 disabled、按不下去，不會重複上傳。
+  const dialogSel = '[role="dialog"]:has-text("已新增"), .chakra-modal__content:has-text("已新增")';
+  const saveBtn = page.locator(`${dialogSel.split(', ').map(s => s + ' button[data-testid="submit-button"]').join(', ')}`).first();
+  if (!(await saveBtn.count())) { await dumpDebugState('upload_no_save_button'); throw new Error('ZUMEN 沒有出現「儲存」按鈕'); }
+  const saveDeadline = Date.now() + 5 * 60000;
+  let clicks = 0;
+  for (;;) {
+    const dialogOpen = await page.locator(dialogSel).first().isVisible().catch(() => false);
+    if (!dialogOpen) break;
+    const busy = await saveBtn.evaluate(b => b.disabled || b.hasAttribute('data-loading')).catch(() => true);
+    if (!busy) {
+      if (Date.now() > saveDeadline) { await dumpDebugState('upload_save_ignored'); throw new Error(`按了 ${clicks} 次「儲存」ZUMEN 都沒有開始上傳`); }
+      await saveBtn.click({ timeout: 5000 }).catch(() => {});
+      clicks++;
+      log(`按下儲存（第 ${clicks} 次）`);
+    }
+    await page.waitForTimeout(busy ? 2000 : 4000);
   }
-  log('已按下儲存，瀏覽器開始傳檔到 ZUMEN');
+  log('ZUMEN 已接受，對話框關閉');
 
-  // ZUMEN 回應不可信，輪詢檔案清單直到新檔出現才算成功。
-  // 逾時依檔案大小放寬：以實測對外上傳 ~200KB/s 估算（每 MB 約 6 秒）再乘兩倍保險
-  const deadline = Date.now() + Math.min(40 * 60000, 120000 + sizeMB * 12000);
+  // ZUMEN 回應不可信，輪詢檔案清單直到新檔出現才算成功
+  const deadline = Date.now() + Math.min(20 * 60000, 120000 + sizeMB * 6000);
   while (Date.now() < deadline) {
     await page.waitForTimeout(3000);
     const now = await listFilesAPI(drawingId, type).catch(() => []);
@@ -465,22 +481,18 @@ async function dumpDebugState(label) {
   } catch (_) {}
 }
 
-app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: '沒有收到檔案' });
-  const drawingId = String(req.params.id).replace(/\D/g, '');
-  const type = String(req.query.type || 'drawing');
+// 收到完整檔案後的共用流程：（影片）壓縮 → 排隊 → 傳到 ZUMEN。回傳 jobId 給手機輪詢
+function startUploadJob({ filePath, size, drawingId, type, cleanup }) {
   const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const job = { state: 'queued', message: '排隊中…', drawingId, type, name: path.basename(req.file.path), createdAt: Date.now() };
+  const job = { state: 'queued', message: '排隊中…', drawingId, type, name: path.basename(filePath), createdAt: Date.now() };
   jobs.set(jobId, job);
-  res.json({ jobId });
 
   const t0 = Date.now();
   const sec = () => Math.round((Date.now() - t0) / 1000);
   const log = step => console.log(`[上傳 ${jobId}] ${sec()}s ${step}`);
   const extra = [];   // 壓縮後產生的檔案，結束時一併清掉
   (async () => {
-    let filePath = req.file.path;
-    let sizeMB = req.file.size / 1048576;
+    let sizeMB = size / 1048576;
     log(`收到 ${job.name}（${sizeMB.toFixed(1)}MB）`);
     // 影片且夠大才壓縮；壓完沒變小（本來就很省）就用原檔
     if (ffmpegPath && VIDEO_EXT.includes(path.extname(filePath).toLowerCase()) && sizeMB >= COMPRESS_MIN_MB) {
@@ -513,10 +525,93 @@ app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
   })().catch(e => { job.state = 'error'; job.message = e.message.slice(0, 200); })
     .finally(() => {
       for (const f of extra) { try { fs.unlinkSync(f); } catch (_) {} }
-      cleanupUpload(req.file);
+      cleanup();
       log(`結束：${job.state} ${job.message}`);
     });
+  return jobId;
+}
+
+// 一次送整個檔案（電腦瀏覽器或舊版手機頁面用）
+app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: '沒有收到檔案' });
+  res.json({ jobId: startUploadJob({
+    filePath: req.file.path, size: req.file.size,
+    drawingId: String(req.params.id).replace(/\D/g, ''), type: String(req.query.type || 'drawing'),
+    cleanup: () => cleanupUpload(req.file)
+  }) });
 });
+
+// ── 分段上傳（手機用，可續傳）──────────────────────────────
+// iPhone 的 Safari 一切到背景、螢幕一鎖，網頁就被暫停，一次送整支影片的請求會整個斷掉重來。
+// 改成每段 2MB 分開送，伺服器記住收到哪裡；手機回到 App、網路恢復、甚至關掉重開，都從斷點接著送。
+// 暫存在 uploads/chunk-<id>/：meta.json（目標圖面、分類、檔名、大小）＋檔案本身
+const chunkDirOf = uid => path.join(uploadDir, 'chunk-' + uid);
+function readChunkMeta(uid) {
+  if (!/^[a-z0-9]{6,40}$/.test(uid)) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(chunkDirOf(uid), 'meta.json'), 'utf8')); } catch (_) { return null; }
+}
+const writeChunkMeta = (uid, meta) => fs.writeFileSync(path.join(chunkDirOf(uid), 'meta.json'), JSON.stringify(meta));
+const receivedOf = meta => { try { return fs.statSync(meta.filePath).size; } catch (_) { return 0; } };
+
+app.post('/api/uploads', (req, res) => {
+  const { drawingId, type, name, fileName } = req.body || {};
+  const size = Number(req.body?.size);
+  const did = String(drawingId || '').replace(/\D/g, '');
+  if (!did || !type || !fileName || !(size > 0)) return res.status(400).json({ error: '資料不完整' });
+  if (size > 2 * 1024 * 1048576) return res.status(400).json({ error: '檔案超過 2GB' });
+  const uid = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  fs.mkdirSync(chunkDirOf(uid), { recursive: true });
+  const ext = path.extname(String(fileName));
+  const wanted = safeName(name);
+  const finalName = wanted ? (wanted.toLowerCase().endsWith(ext.toLowerCase()) ? wanted : wanted + ext) : (safeName(fileName) || 'upload' + ext);
+  const meta = { drawingId: did, type: String(type), filePath: path.join(chunkDirOf(uid), finalName), size, createdAt: Date.now() };
+  fs.writeFileSync(meta.filePath, '');
+  writeChunkMeta(uid, meta);
+  res.json({ uploadId: uid, received: 0 });
+});
+
+app.get('/api/uploads/:uid', (req, res) => {
+  const meta = readChunkMeta(req.params.uid);
+  if (!meta) return res.status(404).json({ error: '找不到這個上傳（可能已過期），請重新上傳' });
+  res.json({ received: receivedOf(meta), size: meta.size, jobId: meta.jobId || null });
+});
+
+app.put('/api/uploads/:uid', express.raw({ type: () => true, limit: '8mb' }), (req, res) => {
+  const meta = readChunkMeta(req.params.uid);
+  if (!meta) return res.status(404).json({ error: '找不到這個上傳（可能已過期），請重新上傳' });
+  const received = receivedOf(meta);
+  // 手機重送了已經收過的段落（例如回應在路上掉了）：告訴它目前收到哪，讓它從那裡接
+  if (Number(req.query.offset) !== received) return res.status(409).json({ received });
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: '沒有收到資料' });
+  if (received + req.body.length > meta.size) return res.status(400).json({ error: '資料超過檔案大小' });
+  fs.appendFileSync(meta.filePath, req.body);
+  res.json({ received: received + req.body.length });
+});
+
+app.post('/api/uploads/:uid/complete', (req, res) => {
+  const uid = req.params.uid;
+  const meta = readChunkMeta(uid);
+  if (!meta) return res.status(404).json({ error: '找不到這個上傳（可能已過期），請重新上傳' });
+  if (meta.jobId) return res.json({ jobId: meta.jobId });   // 重送 complete 不會重複上傳
+  if (receivedOf(meta) !== meta.size) return res.status(409).json({ error: '檔案還沒傳完', received: receivedOf(meta) });
+  meta.jobId = startUploadJob({
+    filePath: meta.filePath, size: meta.size, drawingId: meta.drawingId, type: meta.type,
+    cleanup: () => fs.rmSync(chunkDirOf(uid), { recursive: true, force: true })
+  });
+  writeChunkMeta(uid, meta);
+  res.json({ jobId: meta.jobId });
+});
+
+// 放棄超過 24 小時沒傳完的暫存，避免硬碟被塞滿
+setInterval(() => {
+  for (const d of fs.readdirSync(uploadDir)) {
+    if (!d.startsWith('chunk-')) continue;
+    const meta = readChunkMeta(d.slice(6));
+    if (!meta || (!meta.jobId && Date.now() - meta.createdAt > 24 * 3600 * 1000)) {
+      fs.rmSync(path.join(uploadDir, d), { recursive: true, force: true });
+    }
+  }
+}, 3600 * 1000);
 
 
 // ── Excel 表格新增一筆（生產履歷等）─────────────────────────

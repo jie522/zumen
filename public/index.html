@@ -460,6 +460,7 @@ async function waitReady() {
   renderRecent();
   search('');
   route();
+  resumeUploads();
 }
 
 /* ── 搜尋 / 清單 ── */
@@ -973,53 +974,179 @@ function renderChosen() {
   $('upGo').innerHTML = `${icon('up', 20)}開始上傳${U.files.length > 1 ? `（${U.files.length} 個檔案）` : ''}`;
 }
 
-// 上傳分兩段：①手機→電腦（顯示 % 進度）②電腦→ZUMEN（背景工作，輪詢結果）。
-// 第②段可以離開這個畫面，右下角膠囊會持續顯示進度
+// 上傳分兩段：①手機→電腦 ②電腦→ZUMEN（背景工作，輪詢結果）。
+// 第①段改成每段 2MB 分段送、伺服器記住進度：iPhone 切到別的 App 或鎖螢幕時網頁會被暫停，
+// 回來後從斷點自動接著送；檔案同時存在手機的 IndexedDB，App 被關掉重開也能續傳
+const CHUNK = 2 * 1048576;
 const jobs = [];
+let jobSeq = 0;
+
+/* IndexedDB：存還沒送完的檔案（含檔案本身）與已送完、等 ZUMEN 處理的工作 */
+let dbP = null;
+function idb() {
+  return dbP ||= new Promise((ok, fail) => {
+    const r = indexedDB.open('zm-upload', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('pending', { keyPath: 'key' });
+    r.onsuccess = () => ok(r.result);
+    r.onerror = () => fail(r.error);
+  });
+}
+async function idbDo(mode, fn) {
+  try {
+    const db = await idb();
+    return await new Promise((ok, fail) => {
+      const tx = db.transaction('pending', mode), st = tx.objectStore('pending');
+      const req = fn(st);
+      tx.oncomplete = () => ok(req?.result);
+      tx.onerror = () => fail(tx.error);
+    });
+  } catch (_) { return null; }   // 無痕模式等存不了：照樣上傳，只是不能關掉重開續傳
+}
+const idbSave = j => idbDo('readwrite', st => st.put({ key: j.key, name: j.name, dno: j.dno, id: j.id, type: j.type,
+  fileName: j.fileName, size: j.size, uploadName: j.uploadName, uploadId: j.uploadId || null, jobId: j.jobId || null,
+  blob: j.jobId ? null : j.file }));
+const idbDel = key => idbDo('readwrite', st => st.delete(key));
+
+/* 上傳中讓螢幕保持亮著（iPhone 16.4 以上）：自動鎖定會暫停網頁 */
+let wakeLock = null;
+async function syncWakeLock() {
+  const need = jobs.some(j => j.phase === 'send') && !document.hidden;
+  try {
+    if (need && !wakeLock && navigator.wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!need && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (_) { wakeLock = null; }
+}
+
 function startUpload() {
   const base = $('upName').value.trim();
-  const target = { id: D.id, dno: D.data.drawing_number, type: U.type };
   U.files.forEach((file, i) => {
-    const name = base ? (U.files.length > 1 ? `${base}_${i + 1}` : base) : '';
-    const job = { name: (name || file.name), file, ...target, phase: 'send', pct: 0, msg: '傳送到電腦中…' };
-    jobs.push(job); sendJob(job, name);
+    const uploadName = base ? (U.files.length > 1 ? `${base}_${i + 1}` : base) : '';
+    const job = { key: Date.now().toString(36) + (jobSeq++), name: uploadName || file.name, uploadName, file,
+      fileName: file.name, size: file.size, id: D.id, dno: D.data.drawing_number, type: U.type,
+      phase: 'send', sent: 0, msg: '' };
+    jobs.push(job);
+    idbSave(job);
   });
   U.files = [];
   goBack();
   toast('已開始上傳，可以繼續瀏覽', 'ok');
   renderJobs();
+  kickSender();
 }
-function sendJob(job, name) {
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', `/api/drawings/${job.id}/upload?type=${encodeURIComponent(job.type)}&name=${encodeURIComponent(name)}`);
-  xhr.setRequestHeader('x-pin', PIN);
-  xhr.upload.onprogress = e => { if (e.lengthComputable) { job.pct = Math.round(e.loaded / e.total * 100); renderJobs(); } };
-  xhr.onload = () => {
-    let d = {}; try { d = JSON.parse(xhr.responseText); } catch (_) {}
-    if (xhr.status >= 300 || !d.jobId) return failJob(job, d.error || `傳送失敗 (${xhr.status})`);
-    job.phase = 'zumen'; job.msg = '排隊中…'; job.jobId = d.jobId; job.file = null; renderJobs(); pollJob(job);
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const whenVisible = () => document.hidden ? new Promise(r => {
+  const f = () => { if (!document.hidden) { document.removeEventListener('visibilitychange', f); r(); } };
+  document.addEventListener('visibilitychange', f);
+}) : Promise.resolve();
+
+// 一次只送一個檔，手機頻寬集中，先選的先完成
+let senderRunning = false;
+async function kickSender() {
+  if (senderRunning) return;
+  senderRunning = true;
+  try {
+    let job;
+    while ((job = jobs.find(j => j.phase === 'send'))) {
+      syncWakeLock();
+      try { await sendJob(job); }
+      catch (e) { failJob(job, e.message); }
+    }
+  } finally { senderRunning = false; syncWakeLock(); }
+}
+async function sendJob(job) {
+  let wait = 2000;
+  // 網路斷掉、App 被切到背景都會讓請求失敗：等回到前景再重試，等待時間逐步拉長
+  const retry = async fn => {
+    for (;;) {
+      await whenVisible();
+      try { const r = await fn(); wait = 2000; job.msg = ''; return r; }
+      catch (e) {
+        if (e.fatal) throw e;
+        job.msg = navigator.onLine === false ? '等待網路…' : '連線中斷，自動重試…';
+        renderJobs();
+        await sleep(wait); wait = Math.min(wait * 2, 15000);
+      }
+    }
   };
-  xhr.onerror = () => failJob(job, '網路中斷，請重新上傳');
-  const fd = new FormData(); fd.append('file', job.file);
-  xhr.send(fd);
+  // 4xx（409 除外）是資料本身有問題，重試也沒用；5xx、斷線才重試
+  const call = async (url, opts = {}) => {
+    const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), 'x-pin': PIN } });
+    const d = await r.json().catch(() => ({}));
+    if (r.status >= 400 && r.status < 500 && r.status !== 409) throw Object.assign(new Error(d.error || `錯誤 ${r.status}`), { fatal: true, status: r.status });
+    if (!r.ok && r.status !== 409) throw new Error(d.error || `錯誤 ${r.status}`);
+    return d;
+  };
+  const json = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  // 1. 取得（或接回）伺服器上的上傳編號與進度
+  if (job.uploadId) {
+    try { job.sent = (await retry(() => call('/api/uploads/' + job.uploadId))).received; }
+    catch (e) { if (e.status !== 404) throw e; job.uploadId = null; job.sent = 0; }   // 伺服器上的暫存過期了：從頭送
+  }
+  if (!job.uploadId) {
+    const d = await retry(() => call('/api/uploads', json({ drawingId: job.id, type: job.type, name: job.uploadName, fileName: job.fileName, size: job.size })));
+    job.uploadId = d.uploadId; job.sent = 0;
+    idbSave(job);
+  }
+  renderJobs();
+  // 2. 分段送（409 時伺服器也會回目前收到哪裡，直接從那裡接）
+  while (job.sent < job.size) {
+    const offset = job.sent;
+    const d = await retry(() => call(`/api/uploads/${job.uploadId}?offset=${offset}`,
+      { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: job.file.slice(offset, offset + CHUNK) }));
+    job.sent = d.received;
+    renderJobs();
+  }
+  // 3. 收齊 → 交給電腦壓縮、上傳 ZUMEN
+  const d = await retry(() => call(`/api/uploads/${job.uploadId}/complete`, { method: 'POST' }));
+  job.jobId = d.jobId; job.file = null; job.phase = 'zumen'; job.msg = '排隊中…';
+  idbSave(job);   // 檔案已在電腦上，手機這邊只留工作編號，關掉重開還能看到結果
+  renderJobs();
+  pollJob(job);
 }
-function failJob(job, msg) { job.phase = 'error'; job.msg = msg; renderJobs(); toast('上傳失敗：' + job.name, 'err'); }
+function failJob(job, msg) {
+  job.phase = 'error'; job.msg = msg; renderJobs(); idbDel(job.key);
+  toast('上傳失敗：' + job.name, 'err');
+}
 async function pollJob(job) {
   for (;;) {
-    await new Promise(r => setTimeout(r, 3000));
+    await sleep(3000);
+    await whenVisible();
     try {
       const s = await api('/api/jobs/' + job.jobId);
       job.msg = s.message;
       if (s.state === 'done') {
-        job.phase = 'done'; renderJobs(); toast('上傳完成：' + job.name, 'ok');
+        job.phase = 'done'; renderJobs(); idbDel(job.key); toast('上傳完成：' + job.name, 'ok');
         if (String(D.id) === String(job.id)) refreshFiles();
         return;
       }
       if (s.state === 'error') return failJob(job, s.message);
       renderJobs();
-    } catch (e) { if (/找不到/.test(e.message)) return failJob(job, e.message); }
+    } catch (e) {
+      if (/找不到/.test(e.message)) return failJob(job, '電腦端伺服器重啟過，請到 ZUMEN 確認檔案是否已上傳');
+    }
   }
 }
+// App 被關掉後重開：把沒傳完的接著傳、已交給電腦的繼續追結果
+async function resumeUploads() {
+  const recs = await idbDo('readonly', st => st.getAll()) || [];
+  let n = 0;
+  for (const r of recs) {
+    if (jobs.some(j => j.key === r.key)) continue;
+    const job = { ...r, file: r.blob, sent: 0, msg: '' };
+    delete job.blob;
+    if (r.jobId) { job.phase = 'zumen'; job.msg = '查詢進度…'; jobs.push(job); pollJob(job); n++; }
+    else if (r.blob) { job.phase = 'send'; jobs.push(job); n++; }
+    else idbDel(r.key);
+  }
+  if (n) { toast(`繼續上傳 ${n} 個檔案`, 'ok'); renderJobs(); kickSender(); }
+}
+document.addEventListener('visibilitychange', () => { syncWakeLock(); renderJobs(); });
+window.addEventListener('online', () => renderJobs());
+
 async function refreshFiles() {
   const seq = D.seq;
   try {
@@ -1028,12 +1155,14 @@ async function refreshFiles() {
     D.byType = f.byType; renderVideos(); renderTabs(); renderFiles();
   } catch (_) {}
 }
+const pctOf = j => j.size ? Math.floor(j.sent / j.size * 100) : 0;
+const sendText = j => j.msg || `傳送到電腦 ${pctOf(j)}%（${fmtSize(j.sent)} / ${fmtSize(j.size)}）`;
 function renderJobs() {
   const active = jobs.filter(j => j.phase === 'send' || j.phase === 'zumen');
   $('jobsPill').classList.toggle('hidden', !active.length);
   if (active.length) {
-    const j = active[0];
-    $('jobsTxt').textContent = (j.phase === 'send' ? `傳送到電腦 ${j.pct}%` : (j.msg || 'ZUMEN 處理中').replace(/（[\d.]+MB）/, ''))
+    const j = active.find(x => x.phase === 'send') || active[0];
+    $('jobsTxt').textContent = (j.phase === 'send' ? (j.msg || `傳送到電腦 ${pctOf(j)}%`) : (j.msg || 'ZUMEN 處理中').replace(/（[\d.]+MB）/, ''))
       + (active.length > 1 ? `（共 ${active.length} 個）` : '');
   }
   if ($('jobList')) $('jobList').innerHTML = jobsHtml();
@@ -1042,18 +1171,17 @@ function jobsHtml() {
   if (!jobs.length) return '<div class="fempty">目前沒有上傳</div>';
   return jobs.slice().reverse().map(j => `<div class="job">
     ${j.phase === 'done' ? `<span class="jst ok">${icon('check', 18)}</span>` : j.phase === 'error' ? `<span class="jst err">${icon('warn', 18)}</span>` : '<span class="spin"></span>'}
-    <div class="info"><div class="fn">${esc(j.name)}</div><div class="fm">${esc(j.dno)} · ${esc(j.phase === 'send' ? `傳送到電腦 ${j.pct}%` : j.msg)}</div>
-    ${j.phase === 'send' ? `<div class="pbar"><i style="width:${j.pct}%"></i></div>` : j.phase === 'zumen' ? '<div class="pbar ind"><i></i></div>' : ''}</div></div>`).join('');
+    <div class="info"><div class="fn">${esc(j.name)}</div><div class="fm">${esc(j.dno)} · ${esc(j.phase === 'send' ? sendText(j) : j.msg)}</div>
+    ${j.phase === 'send' ? `<div class="pbar"><i style="width:${pctOf(j)}%"></i></div>` : j.phase === 'zumen' ? '<div class="pbar ind"><i></i></div>' : ''}</div></div>`).join('');
 }
 function openJobs() {
   $('sheet').innerHTML = `<div class="grab"></div><h3>上傳進度</h3>
-    <div style="font-size:13px;color:var(--ink-3);margin-top:4px">「ZUMEN 處理中」時可以關掉這個畫面；傳送到電腦的階段請勿關閉網頁</div>
+    <div style="font-size:13px;color:var(--ink-3);margin-top:4px;line-height:1.6">上傳中可以繼續瀏覽其他圖面。切到別的 App 或鎖定螢幕會暫停，回到 ZUMEN 就從斷點自動繼續；App 被關掉，下次打開也會接著傳。</div>
     <div id="jobList" style="margin-top:8px">${jobsHtml()}</div>
     <button class="bigbtn ghost" onclick="goBack()">關閉</button>`;
   pushOverlay('j');
   $('scrim').classList.add('show'); $('sheet').classList.add('show');
 }
-window.addEventListener('beforeunload', e => { if (jobs.some(j => j.phase === 'send')) { e.preventDefault(); e.returnValue = ''; } });
 
 // 重新整理時若停在 overlay 狀態，先回到乾淨的 hash
 if (location.hash.includes('~')) history.replaceState(null, '', location.hash.split('~')[0]);
