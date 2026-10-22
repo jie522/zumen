@@ -403,7 +403,8 @@ app.get('/api/jobs/:id', (req, res) => {
 const isTailscaleIp = ip => { const [a, b] = ip.split('.').map(Number); return a === 100 && b >= 64 && b <= 127; };
 function lanAddresses() {
   return Object.values(os.networkInterfaces()).flat()
-    .filter(n => n && n.family === 'IPv4' && !n.internal)
+    // 169.254.x.x 是網卡沒拿到位址時的自動位址（Tailscale 未登入時也會出現），手機連不到，排除
+    .filter(n => n && n.family === 'IPv4' && !n.internal && !n.address.startsWith('169.254.'))
     .map(n => n.address);
 }
 app.get('/api/connect-info', (req, res) => {
