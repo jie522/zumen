@@ -248,6 +248,16 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 .sh-body td,.sh-body th{border:1px solid #CFD8DC;padding:7px 10px;white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .sh-body tr.hd td{background:#E8F5E9;font-weight:700;text-align:center}
 .sh-body tr:nth-child(even) td{background:#FAFBFC}
+.sh-add{position:absolute;right:16px;bottom:16px;height:50px;padding:0 20px 0 16px;border-radius:25px;background:var(--accent);color:#fff;font-size:15.5px;font-weight:700;display:flex;align-items:center;gap:6px;box-shadow:0 6px 20px rgba(255,143,0,.45)}
+.row-form{position:absolute;inset:0;background:#fff;display:flex;flex-direction:column;padding:6px 16px 16px;overflow-y:auto}
+.rf-h{display:flex;align-items:center;gap:10px;padding:6px 0 10px;border-bottom:1px solid var(--line-2)}
+.rf-h b{font-size:18px}
+.rf-h span{font-size:12.5px;color:var(--ink-3);flex:1}
+.rf-h .ibtn{color:var(--ink)}
+.rf-body{display:flex;flex-direction:column;gap:14px;padding-top:14px}
+.rf-body label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700;color:var(--ink-2)}
+.rf-body .txt{font-weight:400}
+.rf-ta{height:auto;min-height:110px;padding:12px 14px;resize:vertical;line-height:1.5;font-family:inherit}
 /* 文件第一頁預覽 */
 .pv-doc{position:absolute;inset:0;overflow:auto;display:flex;flex-direction:column;align-items:center;padding:12px 12px 20px;gap:12px}
 .pv-doc img{width:100%;max-width:640px;background:#fff;border-radius:6px}
@@ -300,6 +310,7 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
   <symbol id="i-zoom" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="4" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><rect x="5" y="4" width="22" height="24" rx="3" fill="none" stroke="#0D47A1" stroke-width="2.6"/><path d="M10 11h12M10 16h12M10 21h7" stroke="#0D47A1" stroke-width="2.6" stroke-linecap="round"/><circle cx="23.5" cy="22.5" r="4.5" fill="#FF8F00"/></symbol>
 </svg>
 
@@ -819,12 +830,82 @@ async function showSheet(f, url, foot, drawing) {
     if (!$('viewer').classList.contains('show')) return;
     const tabs = sheets.length > 1 ? `<div class="sh-tabs">${sheets.map((s, i) => `<button class="${i ? '' : 'on'}" onclick="pickSheet(${i}, this)">${esc(s.n)}</button>`).join('')}</div>` : '';
     window._sheets = sheets;
-    showViewer(f.name, `<div class="sheet-wrap">${tabs}<div class="sh-body" id="shBody">${sheets[0]?.html || '（空白表格）'}</div></div>`, url, foot + ' · 左右滑動看更多欄', drawing);
+    // .xlsx 才能在手機新增一筆（舊版 .xls、.csv 不行）；需要知道檔案屬於哪張圖面才能存回去
+    const did = drawing?.id || D.id;
+    const canAdd = ['xlsx', 'xlsm'].includes(f.extension) && did;
+    window._sheetFile = { f, drawing, did };
+    showViewer(f.name, `<div class="sheet-wrap">${tabs}<div class="sh-body" id="shBody">${sheets[0]?.html || '（空白表格）'}</div>
+      ${canAdd ? `<button class="sh-add" onclick="openRowForm()">${icon('plus', 20)}新增一筆</button>` : ''}</div>`, url, foot + ' · 左右滑動看更多欄', drawing);
   } catch (err) {
     showViewer(f.name, `<div class="vmsg"><div class="big">${esc(f.extension)}</div>表格預覽失敗：${esc(err.message)}<br>
       <a href="${esc(url)}" target="_blank" rel="noopener">${icon('ext', 18)}開啟原檔</a></div>`, url, foot, drawing);
   }
 }
+/* ── Excel 表格新增一筆（生產履歷等） ── */
+// 欄位依表格標題自動產生：含「日期」→ 日期選擇（預設今天）、含「人員」→ 記住上次填的名字、最後一欄 → 多行文字
+const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+let rowCols = [];
+async function openRowForm() {
+  const { f } = window._sheetFile;
+  const body = document.querySelector('.sheet-wrap');
+  const form = document.createElement('div');
+  form.className = 'row-form';
+  form.innerHTML = `<div class="vmsg" style="color:var(--ink-3)">${spinHtml.replace('rgba(255,255,255,.2)', 'rgba(21,101,192,.2)').replace('#fff', 'var(--brand)')}<br>讀取欄位…</div>`;
+  body.appendChild(form);
+  try {
+    const d = await api(`/api/sheet-form?type=${encodeURIComponent(f.type)}&id=${f.id}`);
+    rowCols = d.columns;
+    let person = ''; try { person = localStorage.getItem('zm_person') || ''; } catch (_) {}
+    form.innerHTML = `<div class="rf-h"><b>新增一筆</b><span>${esc(d.sheetName)} · 目前 ${d.rows} 筆</span>
+        <button class="ibtn" onclick="this.closest('.row-form').remove()" aria-label="取消">${icon('x', 20)}</button></div>
+      <div class="rf-body">${d.columns.map((c, i) => {
+        const id = 'rf' + i;
+        if (/日期|date/i.test(c)) return `<label>${esc(c)}<input class="txt" id="${id}" type="date" value="${todayStr()}"></label>`;
+        if (/人員|人$|姓名|作業者|name/i.test(c)) return `<label>${esc(c)}<input class="txt" id="${id}" value="${esc(person)}" autocomplete="name"></label>`;
+        if (i === d.columns.length - 1) return `<label>${esc(c)}<textarea class="txt rf-ta" id="${id}" rows="4"></textarea></label>`;
+        return `<label>${esc(c)}<input class="txt" id="${id}"></label>`;
+      }).join('')}</div>
+      <button class="bigbtn" id="rfGo" onclick="submitRow()">${icon('check', 20)}存回 ZUMEN</button>`;
+    form.querySelector('textarea, input:not([type=date])')?.focus();
+  } catch (e) {
+    form.innerHTML = `<div class="rf-h"><b>無法新增</b><button class="ibtn" onclick="this.closest('.row-form').remove()">${icon('x', 20)}</button></div>
+      <div class="rf-body" style="color:var(--red)">${esc(e.message)}</div>`;
+  }
+}
+async function submitRow() {
+  const { f, drawing, did } = window._sheetFile;
+  const values = rowCols.map((c, i) => {
+    const el = $('rf' + i), v = el.value.trim();
+    return el.type === 'date' && v ? v.replace(/-/g, '/') : v;   // 跟範本既有資料一樣用 2026/10/22
+  });
+  if (!values.some(Boolean)) return toast('請至少填一個欄位', 'err');
+  const pi = rowCols.findIndex(c => /人員|人$|姓名|作業者|name/i.test(c));
+  if (pi >= 0 && values[pi]) try { localStorage.setItem('zm_person', values[pi]); } catch (_) {}
+  const btn = $('rfGo');
+  btn.disabled = true;
+  btn.innerHTML = `${spinHtml}送出中…`;
+  try {
+    const { jobId } = await api('/api/sheet-append', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: f.type, id: f.id, name: f.name, drawingId: did, values }) });
+    for (;;) {
+      await new Promise(r => setTimeout(r, 2000));
+      const s = await api('/api/jobs/' + jobId);
+      if ($('rfGo')) $('rfGo').innerHTML = `${spinHtml}${esc(s.message)}`;
+      if (s.state === 'error') throw new Error(s.message);
+      if (s.state === 'done') {
+        toast('已新增一筆並存回 ZUMEN', 'ok');
+        if (String(D.id) === String(did)) await refreshFiles();
+        // 舊檔已換成新檔：用新 id 重新打開表格，看到剛加的那一列
+        if ($('viewer').classList.contains('show')) openFileObj({ ...f, id: s.newId }, drawing);
+        return;
+      }
+    }
+  } catch (e) {
+    toast('新增失敗：' + e.message, 'err');
+    if ($('rfGo')) { btn.disabled = false; btn.innerHTML = `${icon('check', 20)}再試一次`; }
+  }
+}
+
 // 範本表格常留很多空白列（例如生產履歷預留填寫格），手機上全部拿掉；第一個有字的列當表頭
 function tidySheet(html) {
   const box = document.createElement('div');

@@ -446,7 +446,8 @@ async function uploadFileToTab(drawingId, type, filePath, sizeMB, log = () => {}
   while (Date.now() < deadline) {
     await page.waitForTimeout(3000);
     const now = await listFilesAPI(drawingId, type).catch(() => []);
-    if (now.some(f => !before.has(f.id))) { log('ZUMEN 檔案清單已出現新檔'); return true; }
+    const added = now.find(f => !before.has(f.id));
+    if (added) { log('ZUMEN 檔案清單已出現新檔'); return added; }
   }
   await dumpDebugState('upload_timeout');
   return false;
@@ -517,6 +518,97 @@ app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
     });
 });
 
+
+// ── Excel 表格新增一筆（生產履歷等）─────────────────────────
+// ZUMEN 沒有「修改檔案」的 API，只能：下載原檔 → 加一列 → 用同檔名上傳成新檔 →
+// 下載新檔確認那一列真的在（read-back）→ 才刪掉舊檔。任何一步失敗都不刪舊檔，資料不會不見
+const xlsxAppend = require('./xlsx-append');
+const SHEET_FORM_EXT = ['xlsx', 'xlsm'];
+
+async function downloadFile(type, id) {
+  const kind = type === 'drawing' ? 'drawing_file' : 'document_file';
+  const result = await zumeAPI('GET', `/api/${kind}s/urls?${kind}_ids%5B%5D=${id}`);
+  const fileUrl = result.ok && (result.data[`${kind}_urls`] || [])[0]?.file_url;
+  if (!fileUrl) throw new Error('無法取得檔案連結');
+  const r = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 30 * 1048576 });
+  return Buffer.from(r.data);
+}
+
+app.get('/api/sheet-form', async (req, res) => {
+  try {
+    const id = String(req.query.id || '').replace(/\D/g, '');
+    res.json(await xlsxAppend.describe(await downloadFile(String(req.query.type || 'drawing'), id)));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/sheet-append', (req, res) => {
+  const { type, drawingId, values } = req.body || {};
+  const id = String(req.body?.id || '').replace(/\D/g, '');
+  const did = String(drawingId || '').replace(/\D/g, '');
+  if (!id || !did || !type || !Array.isArray(values) || !values.some(v => String(v || '').trim())) {
+    return res.status(400).json({ error: '資料不完整' });
+  }
+  const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const job = { state: 'queued', message: '排隊中…', drawingId: did, type, name: '', createdAt: Date.now() };
+  jobs.set(jobId, job);
+  res.json({ jobId });
+
+  const t0 = Date.now();
+  const log = step => console.log(`[新增一筆 ${jobId}] ${Math.round((Date.now() - t0) / 1000)}s ${step}`);
+  let tmpDir = null;
+  // 整段放進 Playwright 佇列：兩個人同時新增同一個檔，第二個會等第一個換完檔，再拿「最新那份」加，不會互蓋
+  withPage(async () => {
+    job.state = 'uploading';
+    job.message = '讀取原本的 Excel…';
+    const files = await listFilesAPI(did, type);
+    // 原本那份可能剛被別人換掉（id 變了）：同檔名、最新的那份才是目前版本
+    let cur = files.find(f => String(f.id) === id);
+    const fullName = f => f.name + (f.extension && !f.name.endsWith('.' + f.extension) ? '.' + f.extension : '');
+    if (!cur) {
+      const want = req.body.name;
+      cur = files.filter(f => fullName(f) === want).sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0];
+      if (!cur) throw new Error('找不到原本的 Excel，可能已被刪除');
+      log(`原檔 ${id} 已換成 ${cur.id}，改用最新版本`);
+    }
+    const name = fullName(cur);
+    job.name = name;
+    if (!SHEET_FORM_EXT.includes((cur.extension || '').toLowerCase())) throw new Error('只支援 .xlsx 檔');
+
+    const { buffer, row } = await xlsxAppend.appendRow(await downloadFile(type, cur.id), values.map(v => String(v ?? '').trim()));
+    log(`已在第 ${row} 列加入資料`);
+    tmpDir = path.join(uploadDir, 'append-' + jobId);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const tmpFile = path.join(tmpDir, name);
+    fs.writeFileSync(tmpFile, buffer);
+
+    job.message = '存回 ZUMEN 中…';
+    const added = await uploadFileToTab(did, type, tmpFile, buffer.length / 1048576, log);
+    if (!added) throw new Error('新檔上傳逾時，原本的檔案沒有動到');
+
+    // read-back：從 ZUMEN 下載剛上傳的新檔，確認那一列真的在，才刪舊檔
+    job.message = '確認資料…';
+    const got = await xlsxAppend.readRow(await downloadFile(type, added.id), row);
+    const sent = values.map(v => String(v ?? '').trim());
+    if (got.join('\u0001') !== sent.join('\u0001')) {
+      throw new Error('新檔內容核對不符，舊檔保留；ZUMEN 上可能會有兩份，請到電腦確認');
+    }
+    const kind = type === 'drawing' ? 'drawing_files' : 'document_files';
+    const del = await zumeAPI('DELETE', `/api/${kind}/${cur.id}`);
+    log(`新檔 ${added.id} 核對正確；刪除舊檔 ${cur.id}：${del.ok ? 'OK' : del.error}`);
+    job.state = 'done';
+    job.message = del.ok ? '已新增並存回 ZUMEN' : '已新增，但舊檔刪除失敗（ZUMEN 上會有兩份）';
+    job.newId = added.id;
+    job.row = row;
+  }).catch(e => {
+    job.state = 'error';
+    job.message = e.message.slice(0, 200);
+  }).finally(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    log(`結束：${job.state} ${job.message}`);
+  });
+});
 
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
