@@ -1056,6 +1056,7 @@ async function kickSender() {
     }
   } finally { senderRunning = false; syncWakeLock(); }
 }
+let inflight = null;   // 目前送出中的請求，回到前景時中止它重來
 async function sendJob(job) {
   let wait = 2000;
   // 網路斷掉、App 被切到背景都會讓請求失敗：等回到前景再重試，等待時間逐步拉長
@@ -1072,9 +1073,17 @@ async function sendJob(job) {
     }
   };
   // 4xx（409 除外）是資料本身有問題，重試也沒用；5xx、斷線才重試
+  // 每個請求都有逾時，而且回到前景時一律中止重來：iPhone 把網頁凍結再解凍後，凍結前送出的
+  // 請求常常既不成功也不失敗、永遠懸著，上傳就卡死在原地（2026-10-23 實際發生：傳了 6MB 就停了）
   const call = async (url, opts = {}) => {
-    const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), 'x-pin': PIN } });
-    const d = await r.json().catch(() => ({}));
+    const ctl = new AbortController();
+    inflight = ctl;
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    let r, d;
+    try {
+      r = await fetch(url, { ...opts, signal: ctl.signal, headers: { ...(opts.headers || {}), 'x-pin': PIN } });
+      d = await r.json().catch(() => ({}));
+    } finally { clearTimeout(timer); if (inflight === ctl) inflight = null; }
     if (r.status >= 400 && r.status < 500 && r.status !== 409) throw Object.assign(new Error(d.error || `錯誤 ${r.status}`), { fatal: true, status: r.status });
     if (!r.ok && r.status !== 409) throw new Error(d.error || `錯誤 ${r.status}`);
     return d;
@@ -1144,8 +1153,12 @@ async function resumeUploads() {
   }
   if (n) { toast(`繼續上傳 ${n} 個檔案`, 'ok'); renderJobs(); kickSender(); }
 }
-document.addEventListener('visibilitychange', () => { syncWakeLock(); renderJobs(); });
-window.addEventListener('online', () => renderJobs());
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && inflight) inflight.abort();   // 凍結前的請求作廢，重試會先向電腦問「收到哪裡了」
+  syncWakeLock(); renderJobs();
+});
+window.addEventListener('pageshow', e => { if (e.persisted && inflight) inflight.abort(); });
+window.addEventListener('online', () => { if (inflight) inflight.abort(); renderJobs(); });
 
 async function refreshFiles() {
   const seq = D.seq;
