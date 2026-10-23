@@ -178,6 +178,8 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 
 /* 上傳進度膠囊 */
 .jobs-pill{position:fixed;left:16px;bottom:calc(var(--safe-b) + 24px);z-index:46;background:var(--ink);color:#fff;border-radius:22px;height:44px;padding:0 16px;display:flex;align-items:center;gap:10px;font-size:13.5px;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:calc(100% - 200px)}
+.jobs-pill.bad{background:var(--red)}
+.jobs-pill.bad .spin{display:none}
 .jobs-pill .spin{width:16px;height:16px;border-width:2px;border-color:rgba(255,255,255,.3);border-top-color:#fff}
 
 /* ═══ 底部面板 ═══ */
@@ -977,7 +979,7 @@ function renderChosen() {
 // 上傳分兩段：①手機→電腦 ②電腦→ZUMEN（背景工作，輪詢結果）。
 // 第①段改成每段 2MB 分段送、伺服器記住進度：iPhone 切到別的 App 或鎖螢幕時網頁會被暫停，
 // 回來後從斷點自動接著送；檔案同時存在手機的 IndexedDB，App 被關掉重開也能續傳
-const CHUNK = 2 * 1048576;
+const CHUNK = 1048576;   // 1MB 一段：連線慢時一段也不會久到逾時，白白重送
 const jobs = [];
 let jobSeq = 0;
 
@@ -1052,11 +1054,19 @@ async function kickSender() {
     while ((job = jobs.find(j => j.phase === 'send'))) {
       syncWakeLock();
       try { await sendJob(job); }
-      catch (e) { failJob(job, e.message); }
+      catch (e) { failJob(job, e.message || String(e), e); }
     }
   } finally { senderRunning = false; syncWakeLock(); }
 }
 let inflight = null;   // 目前送出中的請求，回到前景時中止它重來
+// 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
+function reportErr(where, job, e) {
+  try {
+    fetch('/api/client-log', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', 'x-pin': PIN },
+      body: JSON.stringify({ where, name: job?.name, sent: job?.sent, size: job?.size, ua: navigator.userAgent,
+        msg: (e?.name ? e.name + ': ' : '') + (e?.message || e) + (e?.status ? ' [HTTP ' + e.status + ']' : '') }) }).catch(() => {});
+  } catch (_) {}
+}
 async function sendJob(job) {
   let wait = 2000;
   // 網路斷掉、App 被切到背景都會讓請求失敗：等回到前景再重試，等待時間逐步拉長
@@ -1066,6 +1076,7 @@ async function sendJob(job) {
       try { const r = await fn(); wait = 2000; job.msg = ''; return r; }
       catch (e) {
         if (e.fatal) throw e;
+        reportErr('重試', job, e);
         job.msg = navigator.onLine === false ? '等待網路…' : '連線中斷，自動重試…';
         renderJobs();
         await sleep(wait); wait = Math.min(wait * 2, 15000);
@@ -1078,7 +1089,7 @@ async function sendJob(job) {
   const call = async (url, opts = {}) => {
     const ctl = new AbortController();
     inflight = ctl;
-    const timer = setTimeout(() => ctl.abort(), 20000);
+    const timer = setTimeout(() => ctl.abort(), 30000);
     let r, d;
     try {
       r = await fetch(url, { ...opts, signal: ctl.signal, headers: { ...(opts.headers || {}), 'x-pin': PIN } });
@@ -1116,9 +1127,10 @@ async function sendJob(job) {
   renderJobs();
   pollJob(job);
 }
-function failJob(job, msg) {
-  job.phase = 'error'; job.msg = msg; renderJobs(); idbDel(job.key);
-  toast('上傳失敗：' + job.name, 'err');
+function failJob(job, msg, err) {
+  job.phase = 'error'; job.msg = msg; job.failSeen = false; renderJobs(); idbDel(job.key);
+  reportErr('失敗', job, err || { message: msg });
+  toast('上傳失敗：' + msg, 'err');
 }
 async function pollJob(job) {
   for (;;) {
@@ -1172,8 +1184,13 @@ const pctOf = j => j.size ? Math.floor(j.sent / j.size * 100) : 0;
 const sendText = j => j.msg || `傳送到電腦 ${pctOf(j)}%（${fmtSize(j.sent)} / ${fmtSize(j.size)}）`;
 function renderJobs() {
   const active = jobs.filter(j => j.phase === 'send' || j.phase === 'zumen');
-  $('jobsPill').classList.toggle('hidden', !active.length);
-  if (active.length) {
+  // 失敗的紅色按鈕留著，直到點開看過原因（提示只有 3 秒，來不及看）
+  const failed = jobs.filter(j => j.phase === 'error' && !j.failSeen);
+  $('jobsPill').classList.toggle('hidden', !active.length && !failed.length);
+  $('jobsPill').classList.toggle('bad', !active.length && !!failed.length);
+  if (!active.length && failed.length) {
+    $('jobsTxt').textContent = '上傳失敗，點此看原因' + (failed.length > 1 ? `（${failed.length} 個）` : '');
+  } else if (active.length) {
     const j = active.find(x => x.phase === 'send') || active[0];
     $('jobsTxt').textContent = (j.phase === 'send' ? (j.msg || `傳送到電腦 ${pctOf(j)}%`) : (j.msg || 'ZUMEN 處理中').replace(/（[\d.]+MB）/, ''))
       + (active.length > 1 ? `（共 ${active.length} 個）` : '');
@@ -1188,6 +1205,8 @@ function jobsHtml() {
     ${j.phase === 'send' ? `<div class="pbar"><i style="width:${pctOf(j)}%"></i></div>` : j.phase === 'zumen' ? '<div class="pbar ind"><i></i></div>' : ''}</div></div>`).join('');
 }
 function openJobs() {
+  jobs.forEach(j => { if (j.phase === 'error') j.failSeen = true; });
+  renderJobs();
   $('sheet').innerHTML = `<div class="grab"></div><h3>上傳進度</h3>
     <div style="font-size:13px;color:var(--ink-3);margin-top:4px;line-height:1.6">上傳中可以繼續瀏覽其他圖面。切到別的 App 或鎖定螢幕會暫停，回到 ZUMEN 就從斷點自動繼續；App 被關掉，下次打開也會接著傳。</div>
     <div id="jobList" style="margin-top:8px">${jobsHtml()}</div>

@@ -545,6 +545,20 @@ app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
 // iPhone 的 Safari 一切到背景、螢幕一鎖，網頁就被暫停，一次送整支影片的請求會整個斷掉重來。
 // 改成每段 2MB 分開送，伺服器記住收到哪裡；手機回到 App、網路恢復、甚至關掉重開，都從斷點接著送。
 // 暫存在 uploads/chunk-<id>/：meta.json（目標圖面、分類、檔名、大小）＋檔案本身
+// 手機端遇到的錯誤（上傳卡住、失敗的原因）回報到這裡，寫進伺服器 log。
+// 手機上看不到 console，沒有這個就只能猜（2026-10-23 傳到 2~4MB 就失敗，電腦端 log 完全看不出原因）
+app.post('/api/client-log', (req, res) => {
+  const b = req.body || {};
+  console.log(`[手機回報] ${String(b.where || '').slice(0, 40)} | ${String(b.name || '').slice(0, 60)} | ${String(b.msg || '').slice(0, 300)} | 已傳 ${b.sent}/${b.size} | ${String(b.ua || '').slice(0, 80)}`);
+  res.json({ ok: true });
+});
+// 分段上傳的每個請求都記一行（method、收到多少、回應狀態），查問題才看得到手機到底送了什麼
+app.use('/api/uploads', (req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => console.log(`[分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 內容${req.headers['content-length'] || 0}B → ${res.statusCode} ${Date.now() - t0}ms`));
+  res.on('close', () => { if (!res.writableEnded) console.log(`[分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 手機中途斷線（已收到 ${req.socket.bytesRead}B）`); });
+  next();
+});
 const chunkDirOf = uid => path.join(uploadDir, 'chunk-' + uid);
 function readChunkMeta(uid) {
   if (!/^[a-z0-9]{6,40}$/.test(uid)) return null;
