@@ -407,7 +407,33 @@ function compressVideo(input, onProgress) {
   });
 }
 
+// 2026-10-23 查了一整天的上傳失敗，真正原因：檔案完整路徑超過 Windows 的 260 字元上限。
+// 瀏覽器讀不到這種檔案，ZUMEN 的「儲存」就悄悄沒反應（對話框開著、按幾次都一樣）。
+// 失敗的檔案路徑都是 272 字元，成功的都是 251~254；手機預設檔名（圖號_日期_時間）剛好多出這 20 字。
+// 這個專案放的資料夾越深越容易遇到，所以交給 ZUMEN 之前，路徑太長就先複製到系統暫存的短路徑。
+function stageShortPath(filePath, log) {
+  const LIMIT = 200;   // 離 260 留足餘量（中文檔名、之後 Windows 自己加的前綴）
+  if (filePath.length <= LIMIT) return { path: filePath, cleanup: () => {} };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zm-'));
+  let base = path.basename(filePath);
+  const maxBase = LIMIT - dir.length - 1;
+  if (base.length > maxBase) {   // 暫存資料夾本身也很長時才會發生：截短檔名但保留副檔名
+    const ext = path.extname(base);
+    base = base.slice(0, Math.max(8, maxBase - ext.length)) + ext;
+  }
+  const short = path.join(dir, base);
+  fs.copyFileSync(filePath, short);
+  log(`路徑太長（${filePath.length} 字元），改用短路徑（${short.length} 字元）交給 ZUMEN`);
+  return { path: short, cleanup: () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} } };
+}
+
 async function uploadFileToTab(drawingId, type, filePath, sizeMB, log = () => {}) {
+  const staged = stageShortPath(filePath, log);
+  try { return await uploadFileToTabInner(drawingId, type, staged.path, sizeMB, log); }
+  finally { staged.cleanup(); }
+}
+
+async function uploadFileToTabInner(drawingId, type, filePath, sizeMB, log = () => {}) {
   if (!page || page.isClosed()) throw new Error('ZUMEN 尚未登入完成');
   const targetUrl = type === 'drawing'
     ? `https://zume-n.com/drawings/${drawingId}`
@@ -450,7 +476,7 @@ async function uploadFileToTab(drawingId, type, filePath, sizeMB, log = () => {}
     if (!dialogOpen) break;
     const busy = await saveBtn.evaluate(b => b.disabled || b.hasAttribute('data-loading')).catch(() => true);
     if (!busy) {
-      if (Date.now() > saveDeadline) { await dumpDebugState('upload_save_ignored'); throw new Error(`按了 ${clicks} 次「儲存」ZUMEN 都沒有開始上傳`); }
+      if (Date.now() > saveDeadline || clicks >= 6) { await dumpDebugState('upload_save_ignored'); throw new Error(`按了 ${clicks} 次「儲存」ZUMEN 都沒有開始上傳`); }
       await saveBtn.click({ timeout: 5000 }).catch(() => {});
       clicks++;
       log(`按下儲存（第 ${clicks} 次）`);
