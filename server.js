@@ -17,7 +17,9 @@ const ACCESS_PIN = (process.env.ACCESS_PIN || '').trim();
 
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+// 一律 no-cache（每次向電腦確認有沒有新版，沒變才用快取）：2026-10-23 手機滑掉重開後仍跑舊版，
+// 修好的程式一直沒生效，還以為是修法沒用
+app.use(express.static(path.join(__dirname, 'public'), { setHeaders: res => res.set('Cache-Control', 'no-cache') }));
 
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });

@@ -1059,11 +1059,13 @@ async function kickSender() {
   } finally { senderRunning = false; syncWakeLock(); }
 }
 let inflight = null;   // 目前送出中的請求，回到前景時中止它重來
+// 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
+const BUILD = 'v5-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {
     fetch('/api/client-log', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json', 'x-pin': PIN },
-      body: JSON.stringify({ where, name: job?.name, sent: job?.sent, size: job?.size, ua: navigator.userAgent,
+      body: JSON.stringify({ where: BUILD + ' ' + where, name: job?.name, sent: job?.sent, size: job?.size, ua: navigator.userAgent,
         msg: (e?.name ? e.name + ': ' : '') + (e?.message || e) + (e?.status ? ' [HTTP ' + e.status + ']' : '') }) }).catch(() => {});
   } catch (_) {}
 }
@@ -1090,38 +1092,65 @@ async function sendJob(job) {
     const ctl = new AbortController();
     inflight = ctl;
     const timer = setTimeout(() => ctl.abort(), 30000);
-    let r, d;
+    let r, text;
     try {
       r = await fetch(url, { ...opts, signal: ctl.signal, headers: { ...(opts.headers || {}), 'x-pin': PIN } });
-      d = await r.json().catch(() => ({}));
+      // 讀回應中途斷線（行動網路、切換 App）會在這裡丟錯，必須讓它往外丟、走重試。
+      // 以前這裡寫 .catch(() => ({}))，把斷線吞掉變成空回應，上傳就誤以為「傳完了」（2026-10-23）
+      text = await r.text();
     } finally { clearTimeout(timer); if (inflight === ctl) inflight = null; }
-    if (r.status >= 400 && r.status < 500 && r.status !== 409) throw Object.assign(new Error(d.error || `錯誤 ${r.status}`), { fatal: true, status: r.status });
-    if (!r.ok && r.status !== 409) throw new Error(d.error || `錯誤 ${r.status}`);
-    return d;
+    let d = null;
+    try { d = JSON.parse(text); } catch (_) {}
+    if (r.status >= 400 && r.status < 500 && r.status !== 409) throw Object.assign(new Error(d?.error || `錯誤 ${r.status}`), { fatal: true, status: r.status });
+    if ((!r.ok && r.status !== 409) || !d) throw new Error(d?.error || `回應異常 (${r.status})`);
+    return Object.assign(d, { _status: r.status });
   };
   const json = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
   // 1. 取得（或接回）伺服器上的上傳編號與進度
   if (job.uploadId) {
-    try { job.sent = (await retry(() => call('/api/uploads/' + job.uploadId))).received; }
+    try {
+      job.sent = (await retry(async () => {
+        const x = await call('/api/uploads/' + job.uploadId);
+        if (!Number.isInteger(x.received)) throw new Error('電腦回應內容不正確');
+        return x;
+      })).received;
+    }
     catch (e) { if (e.status !== 404) throw e; job.uploadId = null; job.sent = 0; }   // 伺服器上的暫存過期了：從頭送
   }
   if (!job.uploadId) {
-    const d = await retry(() => call('/api/uploads', json({ drawingId: job.id, type: job.type, name: job.uploadName, fileName: job.fileName, size: job.size })));
+    const d = await retry(async () => {
+      const x = await call('/api/uploads', json({ drawingId: job.id, type: job.type, name: job.uploadName, fileName: job.fileName, size: job.size }));
+      if (!x.uploadId) throw new Error('電腦回應內容不正確');
+      return x;
+    });
     job.uploadId = d.uploadId; job.sent = 0;
     idbSave(job);
   }
   renderJobs();
   // 2. 分段送（409 時伺服器也會回目前收到哪裡，直接從那裡接）
-  while (job.sent < job.size) {
-    const offset = job.sent;
-    const d = await retry(() => call(`/api/uploads/${job.uploadId}?offset=${offset}`,
-      { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: job.file.slice(offset, offset + CHUNK) }));
-    job.sent = d.received;
-    renderJobs();
+  // 「傳完了」以電腦回報的收到位元組數為準，不靠手機自己的判斷：
+  // 回應缺 received、或 complete 回 409（還沒收齊）都回到迴圈，用電腦說的位置接著送
+  let d;
+  for (let round = 0; ; round++) {
+    while (job.sent < job.size) {
+      const offset = job.sent;
+      const r = await retry(async () => {
+        const x = await call(`/api/uploads/${job.uploadId}?offset=${offset}`,
+          { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: job.file.slice(offset, offset + CHUNK) });
+        if (!Number.isInteger(x.received) || x.received < 0 || x.received > job.size) throw new Error('電腦回應內容不正確');
+        return x;
+      });
+      job.sent = r.received;
+      renderJobs();
+    }
+    // 3. 收齊 → 交給電腦壓縮、上傳 ZUMEN
+    d = await retry(() => call(`/api/uploads/${job.uploadId}/complete`, { method: 'POST' }));
+    if (d.jobId) break;
+    if (round >= 20) throw new Error('電腦一直回報檔案沒收齊');
+    reportErr('complete 未收齊', job, { message: `電腦回報已收 ${d.received}，手機以為 ${job.sent}` });
+    job.sent = Number.isInteger(d.received) ? d.received : (await retry(() => call('/api/uploads/' + job.uploadId))).received;
   }
-  // 3. 收齊 → 交給電腦壓縮、上傳 ZUMEN
-  const d = await retry(() => call(`/api/uploads/${job.uploadId}/complete`, { method: 'POST' }));
   job.jobId = d.jobId; job.file = null; job.phase = 'zumen'; job.msg = '排隊中…';
   idbSave(job);   // 檔案已在電腦上，手機這邊只留工作編號，關掉重開還能看到結果
   renderJobs();
@@ -1170,7 +1199,7 @@ document.addEventListener('visibilitychange', () => {
   syncWakeLock(); renderJobs();
 });
 window.addEventListener('pageshow', e => { if (e.persisted && inflight) inflight.abort(); });
-window.addEventListener('online', () => { if (inflight) inflight.abort(); renderJobs(); });
+window.addEventListener('online', () => renderJobs());   // 網路切換時不中止請求：行動網路 + VPN 常常連續觸發，每次都中止會讓上傳一直重來
 
 async function refreshFiles() {
   const seq = D.seq;
@@ -1210,7 +1239,8 @@ function openJobs() {
   $('sheet').innerHTML = `<div class="grab"></div><h3>上傳進度</h3>
     <div style="font-size:13px;color:var(--ink-3);margin-top:4px;line-height:1.6">上傳中可以繼續瀏覽其他圖面。切到別的 App 或鎖定螢幕會暫停，回到 ZUMEN 就從斷點自動繼續；App 被關掉，下次打開也會接著傳。</div>
     <div id="jobList" style="margin-top:8px">${jobsHtml()}</div>
-    <button class="bigbtn ghost" onclick="goBack()">關閉</button>`;
+    <button class="bigbtn ghost" onclick="goBack()">關閉</button>
+    <div style="text-align:center;font-size:11px;color:var(--ink-3);margin-top:10px">程式版本 ${BUILD}</div>`;
   pushOverlay('j');
   $('scrim').classList.add('show'); $('sheet').classList.add('show');
 }
