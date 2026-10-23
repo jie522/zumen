@@ -92,6 +92,16 @@ select.txt.set{border-color:var(--brand);background-color:var(--brand-l);font-we
 .meta{font-size:12px;color:var(--ink-3);margin-top:4px}
 .chev{color:#C5CFD9;flex-shrink:0}
 /* 預覽模式：比照 ZUMEN 網頁的大圖卡片，手機上兩欄 */
+/* 生產群組標籤：預覽模式貼在縮圖左上角，清單模式放在圖號下面；卡片邊緣用同色，一眼分辨 */
+.gbadge{display:inline-block;padding:2px 9px;border-radius:10px;background:var(--gbg);color:var(--gfg);font-size:12px;font-weight:700;line-height:1.5;white-space:nowrap}
+.gbadge.t{position:absolute;left:8px;top:8px;z-index:2;box-shadow:0 1px 4px rgba(0,0,0,.18)}
+.gbadge.i{display:none}
+.grow{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.item.hasg{border-left:4px solid var(--gfg)}
+.grid .item.hasg{border-left:1px solid var(--line);border-top:4px solid var(--gfg)}
+.list:not(.grid) .gbadge.t{display:none}
+.list:not(.grid) .gbadge.i{display:inline-block}
+.grid .grow{display:none}
 .list.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .grid .item{flex-direction:column;align-items:stretch;gap:0;padding:0;overflow:hidden;border:1px solid var(--line)}
 .grid .thumb{width:100%;height:auto;aspect-ratio:1/1;border-radius:0;border:none;border-bottom:1px solid var(--line-2);background:#fff}
@@ -577,11 +587,24 @@ function hl(text) {
   const words = S.q.split(/\s+/).filter(Boolean).map(w => esc(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   return words.length ? t.replace(new RegExp(`(${words.join('|')})`, 'gi'), '<mark>$1</mark>') : t;
 }
+// 生產群組的顏色：已知的 4 個固定，新增的群組依名稱穩定地分配（同一個名稱永遠同一個顏色）
+const GROUP_COLORS = [['#E3F0FD', '#0D47A1'], ['#E4F5E9', '#1B6E2D'], ['#F1E5F7', '#6A1B9A'], ['#FFEDD5', '#C2410C'], ['#FDE7EA', '#B71C1C'], ['#DDF4F7', '#00697A'], ['#F4F1CE', '#7A6A00']];
+const GROUP_FIXED = { 'A.CNC': 0, 'B.鑽床': 1, 'C.沖床': 2, 'L.車床': 3 };
+function groupColor(t) {
+  if (t in GROUP_FIXED) return GROUP_COLORS[GROUP_FIXED[t]];
+  let h = 0; for (const ch of t) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return GROUP_COLORS[4 + h % 3];
+}
+function groupBadges(groups, cls) {
+  return (groups || []).map(g => { const [bg, fg] = groupColor(g); return `<span class="gbadge ${cls}" style="--gbg:${bg};--gfg:${fg}">${esc(g)}</span>`; }).join('');
+}
 function itemHtml(x) {
-  return `<button class="item" onclick="openDrawing(${x.id})">
-    <div class="thumb">${icon('doc', 26)}${x.thumbnail_url ? `<img src="${esc(x.thumbnail_url)}" loading="lazy" alt="" onerror="this.remove()">` : ''}</div>
+  const gfg = x.groups?.length ? groupColor(x.groups[0])[1] : '';
+  return `<button class="item${gfg ? ' hasg' : ''}" ${gfg ? `style="--gfg:${gfg}"` : ''} onclick="openDrawing(${x.id})">
+    <div class="thumb">${icon('doc', 26)}${x.thumbnail_url ? `<img src="${esc(x.thumbnail_url)}" loading="lazy" alt="" onerror="this.remove()">` : ''}${groupBadges(x.groups, 't')}</div>
     <div class="info">
       <div class="dno">${hl(x.drawing_number || '（無圖號）')}</div>
+      ${x.groups?.length ? `<div class="grow">${groupBadges(x.groups, 'i')}</div>` : ''}
       <div class="pname">${hl(x.product_name || '（無品名）')}</div>
       <div class="meta">更新 ${fmtDate(x.updated_at)}</div>
     </div>
@@ -1133,7 +1156,7 @@ async function kickSender() {
 }
 let inflight = null;   // { abort, t0, reason }：目前送出中的請求
 // 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
-const BUILD = 'v10-1023';
+const BUILD = 'v11-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {

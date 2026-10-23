@@ -247,11 +247,15 @@ function filterQuery(raw) {
   }).join('');
 }
 
+// 清單上每張圖面要看得到生產群組（A.CNC、B.鑽床…）；jig 是生產群組的欄位 ID。
+// 一般清單與搜尋結果的回應都帶 drawing_items（2026-10-23 實測），不用另外查
+const groupsOf = d => [...new Set((d.drawing_items || []).filter(i => i.drawing_item_master_id === 'jig').map(i => String(i.string_value ?? '').trim()).filter(Boolean))];
 const toDrawing = d => ({
   id: d.id,
   drawing_number: getBasicOf(d, 'drawing_number'),
   product_name: getBasicOf(d, 'product_name'),
   thumbnail_url: d.thumbnail_url || '',
+  groups: groupsOf(d),
   updated_at: d.updated_at || ''
 });
 const listUrl = (pg, filters) => `/api/drawings?sort%5Btype%5D=updated&sort%5Bis_asc%5D=0&page=${pg}&per_page=25${filters}`;
