@@ -135,10 +135,12 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 .hero-txt .dno{font-size:16px;white-space:normal;word-break:break-all}
 .hero-txt .pname{font-size:18px;font-weight:700;-webkit-line-clamp:unset;margin-top:4px}
 .hero-txt .upd{font-size:12px;color:var(--ink-3);margin-top:6px}
-.fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
-.fld{background:var(--bg);border-radius:10px;padding:8px 10px;min-width:0}
-.fld small{display:block;font-size:11px;color:var(--ink-3)}
-.fld span{display:block;font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 欄位：比照 ZUMEN 圖面編輯頁，一欄一列、名稱帶圖示、沒填的也列出、多個值各一格 */
+.frows{display:flex;flex-direction:column;gap:12px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line-2)}
+.frow .fl{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:5px}
+.frow .fv{background:var(--bg);border-bottom:1.5px solid var(--line);border-radius:6px 6px 0 0;padding:10px 12px;font-size:15px;word-break:break-all}
+.frow .fv+.fv{margin-top:6px}
+.frow .fv.empty{color:#B7C1CB}
 .memo{margin-top:10px;font-size:13px;color:var(--ink-2);background:#FFF8E1;border-radius:10px;padding:8px 10px;white-space:pre-wrap}
 
 .block{margin-top:18px}
@@ -750,7 +752,7 @@ function renderDetail() {
         <div class="dno">${esc(d.drawing_number || '（無圖號）')}</div>
         <div class="pname">${esc(d.product_name || '（無品名）')}</div>
         <div class="upd">更新 ${fmtDate(d.updated_at)}</div>
-        ${d.fields.length ? `<div class="fields">${d.fields.map(([k, v]) => `<div class="fld"><small>${esc(k)}</small><span>${esc(v)}</span></div>`).join('')}</div>` : ''}
+        ${d.fields.length ? `<div class="frows">${d.fields.map(f => `<div class="frow"><div class="fl">${esc(f.name)}</div>${f.values.length ? f.values.map(v => `<div class="fv">${esc(v)}</div>`).join('') : '<div class="fv empty">—</div>'}</div>`).join('')}</div>` : ''}
         ${d.memo ? `<div class="memo">${esc(d.memo)}</div>` : ''}
       </div>
     </div>
@@ -1131,7 +1133,7 @@ async function kickSender() {
 }
 let inflight = null;   // { abort, t0, reason }：目前送出中的請求
 // 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
-const BUILD = 'v9-1023';
+const BUILD = 'v10-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {

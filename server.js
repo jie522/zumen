@@ -201,7 +201,6 @@ app.get('/api/status', (req, res) => res.json({
 
 // ── 圖面清單 / 搜尋 ───────────────────────────────────────
 const getBasicOf = (d, key) => (d.drawing_basic_items || []).find(i => i.drawing_basic_item_master_id === key)?.value || d[key] || '';
-const getItemOf = (d, key) => (d.drawing_items || []).find(i => i.drawing_item_master_id === key)?.string_value || '';
 
 // ── 篩選（ZUMEN 圖面列表左側那 5 個下拉）──────────────────────
 // 欄位 ID 與顯示名稱對不上（serial_number=分類、machine=廠商/客戶），見電腦版 ZUMEN-API.md。
@@ -229,7 +228,8 @@ app.get('/api/filter-options', async (req, res) => {
       const v = String(it.string_value ?? '').trim();
       if (v && it.id && maps[it.drawing_item_master_id] && !maps[it.drawing_item_master_id].has(v)) maps[it.drawing_item_master_id].set(v, it.id);
     }
-    filterOptionsCache = FILTER_FIELDS.map(([id, label]) => ({ id, label,
+    const names = Object.fromEntries((await getItemSettings()).map(f => [f.id, f.name]));
+    filterOptionsCache = FILTER_FIELDS.map(([id, label]) => ({ id, label: names[id] || label,
       values: [...maps[id]].map(([text, vid]) => ({ text, id: vid })).sort((a, b) => collator.compare(a.text, b.text)) }));
     filterOptionsAt = Date.now();
   }
@@ -304,25 +304,39 @@ app.get('/api/drawings', async (req, res) => {
   }
 });
 
+// ZUMEN 的欄位設定：名稱含圖示（🏭生產線別、🔠生產群組…）、順序、是否顯示。
+// 欄位 ID 與顯示名稱對不上（serial_number=分類、machine=廠商/客戶、subcontractor=投料單號），見電腦版 ZUMEN-API.md
+const DEFAULT_ITEM_SETTINGS = [
+  { id: 'custom_string_item_2', name: '🏭生產線別' }, { id: 'jig', name: '🔠生產群組' }, { id: 'serial_number', name: '🗂️分類' },
+  { id: 'machine', name: '🏪廠商/客戶' }, { id: 'processing_method', name: '加工方式' }, { id: 'subcontractor', name: '投料單號' },
+];
+let itemSettingsCache = null, itemSettingsAt = 0;
+async function getItemSettings() {
+  if (itemSettingsCache && Date.now() - itemSettingsAt < 10 * 60 * 1000) return itemSettingsCache;
+  const r = await zumeAPI('GET', '/api/drawing_item_settings?is_visible=1');
+  const list = r.ok && (r.data.drawing_item_settings || [])
+    .filter(i => i.data_type === 'string' && i.is_visible !== false && i.drawing_item_master_id)
+    .map(i => ({ id: i.drawing_item_master_id, name: String(i.name || '').trim() || i.drawing_item_master_id }));
+  if (list && list.length) { itemSettingsCache = list; itemSettingsAt = Date.now(); return list; }
+  return itemSettingsCache || DEFAULT_ITEM_SETTINGS;   // ZUMEN 暫時讀不到就用上次的或預設
+}
+
 app.get('/api/drawings/:id', async (req, res) => {
   const result = await zumeAPI('GET', `/api/drawings/${encodeURIComponent(req.params.id)}`);
   if (!result.ok) return res.status(502).json({ error: result.error || '載入失敗' });
   const d = result.data.drawing || result.data;
-  // 欄位 ID 與顯示名稱對不上（serial_number=分類、machine=廠商/客戶、subcontractor=投料單號），見電腦版 ZUMEN-API.md
+  // 欄位的名稱（含圖示）與順序直接取自 ZUMEN 的欄位設定，跟網頁編輯頁一致；
+  // 每個欄位可以有多個值（網頁上的「＋新增」），全部列出；沒填的也保留（值是空陣列）
   res.json({
     id: d.id,
     drawing_number: getBasicOf(d, 'drawing_number'),
     product_name: getBasicOf(d, 'product_name'),
     thumbnail_url: d.thumbnail_url || '',
     memo: d.memo || '',
-    fields: [
-      ['生產線別', getItemOf(d, 'custom_string_item_2')],
-      ['生產群組', getItemOf(d, 'jig')],
-      ['分類', getItemOf(d, 'serial_number')],
-      ['廠商/客戶', getItemOf(d, 'machine')],
-      ['加工方式', getItemOf(d, 'processing_method')],
-      ['投料單號', getItemOf(d, 'subcontractor')],
-    ].filter(([, v]) => v),
+    fields: (await getItemSettings()).map(f => ({
+      id: f.id, name: f.name,
+      values: [...new Set((d.drawing_items || []).filter(i => i.drawing_item_master_id === f.id).map(i => String(i.string_value ?? '').trim()).filter(Boolean))]
+    })),
     updated_at: d.updated_at || ''
   });
 });
