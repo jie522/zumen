@@ -115,12 +115,15 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 .bar.scrolled .bt{opacity:1}
 .det{padding:0 12px calc(var(--safe-b) + 110px)}
 .hero{background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 1px 3px rgba(16,32,44,.08)}
-.hero-img{height:230px;display:grid;place-items:center;background:#fff;border-bottom:1px solid var(--line-2);position:relative}
-.hero-img img{max-width:100%;max-height:100%;object-fit:contain}
+/* iPhone Safari 算不出 grid 裡 max-height:100%，圖片用原尺寸撐開、蓋住下面的品名（2026-10-23）：改成絕對定位填滿再 contain，超出的一律裁掉 */
+.hero-img{height:230px;background:#fff;border-bottom:1px solid var(--line-2);position:relative;overflow:hidden}
+.hero-img img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.hero-img>div{position:absolute;inset:0;display:grid;place-items:center}
 .hero-img .zoom{position:absolute;right:10px;bottom:10px;background:rgba(22,32,44,.72);color:#fff;font-size:12px;padding:5px 10px;border-radius:20px;display:flex;gap:5px;align-items:center}
 .hero-txt{padding:14px 16px 16px}
 .hero-txt .dno{font-size:16px;white-space:normal;word-break:break-all}
 .hero-txt .pname{font-size:18px;font-weight:700;-webkit-line-clamp:unset;margin-top:4px}
+.hero-txt .upd{font-size:12px;color:var(--ink-3);margin-top:6px}
 .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
 .fld{background:var(--bg);border-radius:10px;padding:8px 10px;min-width:0}
 .fld small{display:block;font-size:11px;color:var(--ink-3)}
@@ -178,6 +181,7 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
 
 /* 上傳進度膠囊 */
 .jobs-pill{position:fixed;left:16px;bottom:calc(var(--safe-b) + 24px);z-index:46;background:var(--ink);color:#fff;border-radius:22px;height:44px;padding:0 16px;display:flex;align-items:center;gap:10px;font-size:13.5px;box-shadow:0 6px 20px rgba(0,0,0,.25);max-width:calc(100% - 200px)}
+#jobsTxt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .jobs-pill.bad{background:var(--red)}
 .jobs-pill.bad .spin{display:none}
 .jobs-pill .spin{width:16px;height:16px;border-width:2px;border-color:rgba(255,255,255,.3);border-top-color:#fff}
@@ -679,6 +683,7 @@ function renderDetail() {
       <div class="hero-txt">
         <div class="dno">${esc(d.drawing_number || '（無圖號）')}</div>
         <div class="pname">${esc(d.product_name || '（無品名）')}</div>
+        <div class="upd">更新 ${fmtDate(d.updated_at)}</div>
         ${d.fields.length ? `<div class="fields">${d.fields.map(([k, v]) => `<div class="fld"><small>${esc(k)}</small><span>${esc(v)}</span></div>`).join('')}</div>` : ''}
         ${d.memo ? `<div class="memo">${esc(d.memo)}</div>` : ''}
       </div>
@@ -688,7 +693,7 @@ function renderDetail() {
       <div id="vids"><div class="vids"><div class="vcard"><div class="vposter sk"></div></div><div class="vcard"><div class="vposter sk"></div></div></div></div>
     </div>
     <div class="block">
-      <div class="block-h">${icon('folder', 20)}檔案<span class="side">更新 ${fmtDate(d.updated_at)}</span></div>
+      <div class="block-h">${icon('folder', 20)}檔案</div>
       <div class="tabs" id="tabs"></div>
       <div class="files" id="files"><div class="fempty"><span class="spin" style="display:inline-block"></span></div></div>
     </div>`;
@@ -1060,7 +1065,7 @@ async function kickSender() {
 }
 let inflight = null;   // { abort, t0, reason }：目前送出中的請求
 // 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
-const BUILD = 'v7-1023';
+const BUILD = 'v8-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {
@@ -1118,29 +1123,39 @@ function xhrCall(method, url, { body = null, json = null, timeout = 20000, onPro
 // 60MB 要傳快一小時）；電腦對「查進度」這種小請求的回應卻收得到。
 // 所以資料送完後 1.5 秒沒收到回應，就改問電腦「收到多少了」，已收齊這段就直接往下一段
 let lostReplies = 0;
+// 分段大小自動調整：資料 3 秒內送完就加倍（最大 4MB），超過 12 秒就減半（最小 256KB），失敗也減半。
+// 固定 1MB 時每段都要多等一個來回，快的網路反而被拖慢（2026-10-23 iPhone 57MB 要 3.5 分鐘）
+const MAX_CHUNK = 4 * 1048576, MIN_CHUNK = 256 * 1024;
+function adaptChunk(job, upT) {
+  const c = job.chunk || CHUNK;
+  if (upT && upT < 3000) job.chunk = Math.min(c * 2, MAX_CHUNK);
+  else if (upT > 12000) job.chunk = Math.max(Math.floor(c / 2), MIN_CHUNK);
+}
 async function putChunk(job, offset, len) {
   const end = offset + len;
-  let uploaded = false, done = false, res = null, err = null, put = null;
+  let uploaded = false, done = false, res = null, err = null, put = null, upT = 0;
+  const t0 = Date.now();
   const p = xhrCall('PUT', `/api/uploads/${job.uploadId}?offset=${offset}`,
-    { body: job.file.slice(offset, end), timeout: 45000, onProgress: n => { job.partial = n; renderJobs(); }, onUploaded: c => { uploaded = true; put = c; } })
+    { body: job.file.slice(offset, end), timeout: 45000, onProgress: n => { job.partial = n; renderJobs(); }, onUploaded: c => { uploaded = true; put = c; upT = Date.now() - t0; } })
     .then(r => { res = r; }, e => { err = e; }).finally(() => { done = true; });
   let nextCheck = 0;
   while (!done) {
     await sleep(100);
-    if (uploaded && !nextCheck) nextCheck = Date.now() + 1500;
+    if (uploaded && !nextCheck) nextCheck = Date.now() + 800;
     if (nextCheck && !done && Date.now() >= nextCheck) {
-      nextCheck = Date.now() + 1500;
+      nextCheck = Date.now() + 1000;
       try {
         const s = await xhrCall('GET', '/api/uploads/' + job.uploadId, { timeout: 8000, track: false });
         if (!done && Number.isInteger(s.received) && s.received >= end) {
           if (lostReplies++ < 3) reportErr('回應遺失改查進度', job, { message: `資料已送完但沒收到回應，查詢確認電腦已收到 ${s.received}（第 ${lostReplies} 次）` });
           put?.abort();   // 不等它結束：已經完成的請求 abort 不會觸發任何事件，等了反而永遠卡住
+          adaptChunk(job, upT);
           return { received: s.received };
         }
       } catch (_) { /* 查詢也失敗就繼續等 PUT 本身的結果或逾時 */ }
     }
   }
-  if (res) return res;
+  if (res) { adaptChunk(job, upT); return res; }
   throw err;
 }
 
@@ -1154,6 +1169,7 @@ async function sendJob(job) {
       catch (e) {
         if (e.fatal) throw e;
         reportErr('重試#' + (attempt + 1), job, e);
+        job.chunk = Math.max(Math.floor((job.chunk || CHUNK) / 2), MIN_CHUNK);   // 出錯就縮小分段，網路差時比較容易成功
         job.msg = navigator.onLine === false ? '等待網路…' : '連線中斷，自動重試…';
         renderJobs();
         await sleep(wait); wait = Math.min(wait * 2, 15000);
@@ -1187,7 +1203,7 @@ async function sendJob(job) {
           if (Number.isInteger(s.received) && s.received !== offset) return { received: s.received };
         }
         job.partial = 0;
-        const x = await putChunk(job, offset, Math.min(CHUNK, job.size - offset));
+        const x = await putChunk(job, offset, Math.min(job.chunk || CHUNK, job.size - offset));
         return need(x, y => Number.isInteger(y.received) && y.received >= 0 && y.received <= job.size);
       });
       job.sent = r.received; job.partial = 0;
