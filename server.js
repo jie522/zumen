@@ -551,14 +551,15 @@ app.post('/api/drawings/:id/upload', upload.single('file'), (req, res) => {
 // 手機上看不到 console，沒有這個就只能猜（2026-10-23 傳到 2~4MB 就失敗，電腦端 log 完全看不出原因）
 app.post('/api/client-log', (req, res) => {
   const b = req.body || {};
-  console.log(`[手機回報] ${String(b.where || '').slice(0, 40)} | ${String(b.name || '').slice(0, 60)} | ${String(b.msg || '').slice(0, 300)} | 已傳 ${b.sent}/${b.size} | ${String(b.ua || '').slice(0, 80)}`);
+  console.log(`${new Date().toLocaleTimeString('en-GB')} [手機回報] ${String(b.where || '').slice(0, 40)} | ${String(b.name || '').slice(0, 60)} | ${String(b.msg || '').slice(0, 300)} | 已傳 ${b.sent}/${b.size} | ${String(b.ua || '').slice(0, 80)}`);
   res.json({ ok: true });
 });
 // 分段上傳的每個請求都記一行（method、收到多少、回應狀態），查問題才看得到手機到底送了什麼
 app.use('/api/uploads', (req, res, next) => {
   const t0 = Date.now();
-  res.on('finish', () => console.log(`[分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 內容${req.headers['content-length'] || 0}B → ${res.statusCode} ${Date.now() - t0}ms`));
-  res.on('close', () => { if (!res.writableEnded) console.log(`[分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 手機中途斷線（已收到 ${req.socket.bytesRead}B）`); });
+  const ts = () => new Date().toLocaleTimeString('en-GB');
+  res.on('finish', () => console.log(`${ts()} [分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 內容${req.headers['content-length'] || 0}B → ${res.statusCode} ${Date.now() - t0}ms`));
+  res.on('close', () => { if (!res.writableEnded) console.log(`${ts()} [分段] ${req.method} ${req.originalUrl.replace('/api/uploads', '') || '/'} 手機中途斷線（已收到 ${req.socket.bytesRead}B）`); });
   next();
 });
 const chunkDirOf = uid => path.join(uploadDir, 'chunk-' + uid);
