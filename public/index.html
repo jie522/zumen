@@ -1060,7 +1060,7 @@ async function kickSender() {
 }
 let inflight = null;   // { abort, t0, reason }：目前送出中的請求
 // 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
-const BUILD = 'v6-1023';
+const BUILD = 'v7-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {
@@ -1073,13 +1073,13 @@ function reportErr(where, job, e) {
 // 所有上傳相關請求都走 XHR（不用 fetch）：XHR 能分開知道「資料送完了」與「回應收到了」兩個時間點，
 // 失敗時回報卡在哪一步。2026-10-23 iPhone 實測：電腦 0.4 秒就收齊一段並回應，
 // 但手機一直等不到回應、逾時中止重送，上傳卡在第一段（只用 fetch 看不出是送不出去還是收不到回應）
-function xhrCall(method, url, { body = null, json = null, timeout = 20000, onProgress } = {}) {
+function xhrCall(method, url, { body = null, json = null, timeout = 20000, onProgress, onUploaded, track = true } = {}) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const t0 = Date.now();
     let upMs = 0;
     const cur = { t0, reason: '', abort: () => xhr.abort() };
-    inflight = cur;
+    if (track) inflight = cur;
     const done = () => { if (inflight === cur) inflight = null; };
     xhr.open(method, url);
     xhr.setRequestHeader('x-pin', PIN);
@@ -1087,7 +1087,7 @@ function xhrCall(method, url, { body = null, json = null, timeout = 20000, onPro
     else if (body) xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.timeout = timeout;
     if (xhr.upload) {
-      xhr.upload.onload = () => { upMs = Date.now() - t0; };
+      xhr.upload.onload = () => { upMs = Date.now() - t0; if (onUploaded) onUploaded(cur); };
       if (onProgress) xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded); };
     }
     const fail = kind => {
@@ -1111,6 +1111,37 @@ function xhrCall(method, url, { body = null, json = null, timeout = 20000, onPro
     };
     xhr.send(json ? JSON.stringify(json) : body);
   });
+}
+
+// 送一段並確認電腦收到。2026-10-23 iPhone（行動網路 + Tailscale）實測：資料 0.2 秒送完、
+// 電腦也收到了，但電腦對「上傳」的回應一直到不了手機，白等逾時 45 秒（每段都這樣，
+// 60MB 要傳快一小時）；電腦對「查進度」這種小請求的回應卻收得到。
+// 所以資料送完後 1.5 秒沒收到回應，就改問電腦「收到多少了」，已收齊這段就直接往下一段
+let lostReplies = 0;
+async function putChunk(job, offset, len) {
+  const end = offset + len;
+  let uploaded = false, done = false, res = null, err = null, put = null;
+  const p = xhrCall('PUT', `/api/uploads/${job.uploadId}?offset=${offset}`,
+    { body: job.file.slice(offset, end), timeout: 45000, onProgress: n => { job.partial = n; renderJobs(); }, onUploaded: c => { uploaded = true; put = c; } })
+    .then(r => { res = r; }, e => { err = e; }).finally(() => { done = true; });
+  let nextCheck = 0;
+  while (!done) {
+    await sleep(100);
+    if (uploaded && !nextCheck) nextCheck = Date.now() + 1500;
+    if (nextCheck && !done && Date.now() >= nextCheck) {
+      nextCheck = Date.now() + 1500;
+      try {
+        const s = await xhrCall('GET', '/api/uploads/' + job.uploadId, { timeout: 8000, track: false });
+        if (!done && Number.isInteger(s.received) && s.received >= end) {
+          if (lostReplies++ < 3) reportErr('回應遺失改查進度', job, { message: `資料已送完但沒收到回應，查詢確認電腦已收到 ${s.received}（第 ${lostReplies} 次）` });
+          put?.abort();   // 不等它結束：已經完成的請求 abort 不會觸發任何事件，等了反而永遠卡住
+          return { received: s.received };
+        }
+      } catch (_) { /* 查詢也失敗就繼續等 PUT 本身的結果或逾時 */ }
+    }
+  }
+  if (res) return res;
+  throw err;
 }
 
 async function sendJob(job) {
@@ -1156,8 +1187,7 @@ async function sendJob(job) {
           if (Number.isInteger(s.received) && s.received !== offset) return { received: s.received };
         }
         job.partial = 0;
-        const x = await xhrCall('PUT', `/api/uploads/${job.uploadId}?offset=${offset}`,
-          { body: job.file.slice(offset, offset + CHUNK), timeout: 45000, onProgress: n => { job.partial = n; renderJobs(); } });
+        const x = await putChunk(job, offset, Math.min(CHUNK, job.size - offset));
         return need(x, y => Number.isInteger(y.received) && y.received >= 0 && y.received <= job.size);
       });
       job.sent = r.received; job.partial = 0;
