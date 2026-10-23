@@ -203,24 +203,105 @@ app.get('/api/status', (req, res) => res.json({
 const getBasicOf = (d, key) => (d.drawing_basic_items || []).find(i => i.drawing_basic_item_master_id === key)?.value || d[key] || '';
 const getItemOf = (d, key) => (d.drawing_items || []).find(i => i.drawing_item_master_id === key)?.string_value || '';
 
+// ── 篩選（ZUMEN 圖面列表左側那 5 個下拉）──────────────────────
+// 欄位 ID 與顯示名稱對不上（serial_number=分類、machine=廠商/客戶），見電腦版 ZUMEN-API.md。
+// 2026-10-23 用 Playwright 在 ZUMEN 網頁選篩選抓到的請求格式：
+//   /api/drawings?drawing_items[0][drawing_item_master_id]=jig&drawing_items[0][is_empty]=0&drawing_items[0][values][0]=7121550
+// values 放的是「選項的編號」不是文字（A.CNC=7121550）；編號就是 /api/drawing_items?data_type=string 每筆的 id，
+// 一個值對一個編號。直接送文字會回「發生驗證錯誤」。多個欄位用 [0] [1] [2] 疊加（且的關係）
+const FILTER_FIELDS = [
+  ['custom_string_item_2', '生產線別'],
+  ['jig', '生產群組'],
+  ['serial_number', '分類'],
+  ['machine', '廠商/客戶'],
+  ['processing_method', '加工方式'],
+];
+const FILTER_IDS = new Set(FILTER_FIELDS.map(f => f[0]));
+const collator = new Intl.Collator('zh-Hant', { numeric: true });
+let filterOptionsCache = null, filterOptionsAt = 0;
+app.get('/api/filter-options', async (req, res) => {
+  // 10 分鐘快取：這支會撈全公司所有圖面的欄位值，很大；新值最多晚 10 分鐘出現在下拉
+  if (!filterOptionsCache || Date.now() - filterOptionsAt > 10 * 60 * 1000) {
+    const result = await zumeAPI('GET', '/api/drawing_items?data_type=string');
+    if (!result.ok) return res.status(502).json({ error: result.error || '載入失敗' });
+    const maps = Object.fromEntries(FILTER_FIELDS.map(([id]) => [id, new Map()]));
+    for (const it of result.data.drawing_items || []) {
+      const v = String(it.string_value ?? '').trim();
+      if (v && it.id && maps[it.drawing_item_master_id] && !maps[it.drawing_item_master_id].has(v)) maps[it.drawing_item_master_id].set(v, it.id);
+    }
+    filterOptionsCache = FILTER_FIELDS.map(([id, label]) => ({ id, label,
+      values: [...maps[id]].map(([text, vid]) => ({ text, id: vid })).sort((a, b) => collator.compare(a.text, b.text)) }));
+    filterOptionsAt = Date.now();
+  }
+  res.json({ fields: filterOptionsCache });
+});
+// 手機傳來 f=[{"id":"jig","value":7121550},{"id":"machine","value":10513732}]（value = 選項編號）
+function filterQuery(raw) {
+  let list = [];
+  try { list = JSON.parse(raw || '[]'); } catch (_) {}
+  if (!Array.isArray(list)) return '';
+  const seen = new Set();
+  return list.filter(f => f && FILTER_IDS.has(f.id) && /^[0-9]+$/.test(String(f.value)) && !seen.has(f.id) && seen.add(f.id)).map((f, i) => {
+    const key = suffix => encodeURIComponent(`drawing_items[${i}]${suffix}`);
+    return `&${key('[drawing_item_master_id]')}=${f.id}&${key('[is_empty]')}=0&${key('[values][0]')}=${f.value}`;
+  }).join('');
+}
+
+const toDrawing = d => ({
+  id: d.id,
+  drawing_number: getBasicOf(d, 'drawing_number'),
+  product_name: getBasicOf(d, 'product_name'),
+  thumbnail_url: d.thumbnail_url || '',
+  updated_at: d.updated_at || ''
+});
+const listUrl = (pg, filters) => `/api/drawings?sort%5Btype%5D=updated&sort%5Bis_asc%5D=0&page=${pg}&per_page=25${filters}`;
+
+// ZUMEN 的全文搜尋（freeword_search）不吃篩選條件（2026-10-23 實測：搜尋 TC 20 筆，加篩選還是 20 筆）。
+// 同時有文字和篩選時：先取回符合篩選的全部圖面（公司全部 427 筆，最多 18 頁，分批同時抓），
+// 再用圖號、品名比對文字，自己分頁。結果快取 90 秒，連續輸入文字不會重抓
+const filteredCache = new Map();   // 篩選條件 -> { at, list }
+async function allFiltered(filters) {
+  const hit = filteredCache.get(filters);
+  if (hit && Date.now() - hit.at < 90000) return hit.list;
+  const first = await zumeAPI('GET', listUrl(1, filters));
+  if (!first.ok) throw new Error(first.error || '載入失敗');
+  const last = first.data.last_page || 1;
+  let rows = [...(first.data.drawings || [])];
+  for (let p = 2; p <= last; p += 6) {
+    const batch = await Promise.all(Array.from({ length: Math.min(6, last - p + 1) }, (_, k) => zumeAPI('GET', listUrl(p + k, filters))));
+    for (const r of batch) { if (!r.ok) throw new Error(r.error || '載入失敗'); rows.push(...(r.data.drawings || [])); }
+  }
+  const list = rows.map(toDrawing);
+  filteredCache.set(filters, { at: Date.now(), list });
+  if (filteredCache.size > 20) filteredCache.delete(filteredCache.keys().next().value);
+  return list;
+}
+
 app.get('/api/drawings', async (req, res) => {
   const q = String(req.query.q || '').trim();
   const pg = Number(req.query.page) || 1;
-  // per_page 上限 25，超過 ZUMEN 回 422；搜尋要走 freeword_search 才跟網頁版結果一致
-  const endpoint = q
-    ? `/api/drawings/freeword_search?query=${encodeURIComponent(q)}&page=${pg}&sort%5Btype%5D=created_at_desc`
-    : `/api/drawings?sort%5Btype%5D=updated&sort%5Bis_asc%5D=0&page=${pg}&per_page=25`;
-  const result = await zumeAPI('GET', endpoint);
-  if (!result.ok) return res.status(502).json({ error: result.error || '載入失敗' });
-  const data = result.data;
-  const drawings = (data.drawings || []).map(d => ({
-    id: d.id,
-    drawing_number: getBasicOf(d, 'drawing_number'),
-    product_name: getBasicOf(d, 'product_name'),
-    thumbnail_url: d.thumbnail_url || '',
-    updated_at: d.updated_at || ''
-  }));
-  res.json({ drawings, total: data.total_count ?? drawings.length, last_page: data.last_page || 1, page: pg });
+  const filters = filterQuery(req.query.f);
+  try {
+    if (q && filters) {
+      const words = q.toLowerCase().split(/s+/).filter(Boolean);
+      const hits = (await allFiltered(filters)).filter(d => {
+        const text = (d.drawing_number + ' ' + d.product_name).toLowerCase();
+        return words.every(w => text.includes(w));
+      });
+      return res.json({ drawings: hits.slice((pg - 1) * 25, pg * 25), total: hits.length, last_page: Math.max(1, Math.ceil(hits.length / 25)), page: pg });
+    }
+    // per_page 上限 25，超過 ZUMEN 回 422；只有文字搜尋時走 freeword_search 才跟網頁版結果一致
+    const endpoint = q
+      ? `/api/drawings/freeword_search?query=${encodeURIComponent(q)}&page=${pg}&sort%5Btype%5D=created_at_desc`
+      : listUrl(pg, filters);
+    const result = await zumeAPI('GET', endpoint);
+    if (!result.ok) return res.status(502).json({ error: result.error || '載入失敗' });
+    const data = result.data;
+    const drawings = (data.drawings || []).map(toDrawing);
+    res.json({ drawings, total: data.total_count ?? drawings.length, last_page: data.last_page || 1, page: pg });
+  } catch (e) {
+    res.status(502).json({ error: e.message || '載入失敗' });
+  }
 });
 
 app.get('/api/drawings/:id', async (req, res) => {

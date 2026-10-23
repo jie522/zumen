@@ -50,6 +50,17 @@ svg{display:block}
 .kind{display:flex;gap:4px;margin-top:12px;background:rgba(255,255,255,.12);border-radius:12px;padding:4px}
 .kind button{flex:1;height:34px;border-radius:9px;color:rgba(255,255,255,.8);font-size:14.5px;font-weight:700}
 .kind button.on{background:#fff;color:var(--brand-d)}
+.kind button.kf{flex:0 0 auto;padding:0 14px;display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.16);color:#fff}
+.kind button.kf.has{background:var(--accent)}
+.kind .kn{min-width:20px;height:20px;border-radius:10px;background:#fff;color:var(--accent);font-size:12px;display:grid;place-items:center;padding:0 5px}
+.fchips{display:flex;flex-wrap:wrap;gap:8px;padding:2px 4px 12px}
+.fchip{display:flex;align-items:center;gap:6px;height:34px;padding:0 6px 0 12px;border-radius:17px;background:var(--brand-l);color:var(--brand-d);font-size:13.5px;font-weight:700}
+.fchip small{font-weight:500;color:var(--ink-2)}
+.fchip button{width:26px;height:26px;border-radius:13px;display:grid;place-items:center;color:var(--brand-d)}
+.fchip button:active{background:rgba(21,101,192,.18)}
+.fchip.clr{background:#fff;color:var(--ink-2);padding:0 14px;font-weight:500;box-shadow:0 1px 2px rgba(16,32,44,.08)}
+select.txt{appearance:none;-webkit-appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath d='M6 9l6 6 6-6' fill='none' stroke='%2393A1AF' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center;padding-right:40px;color:var(--ink)}
+select.txt.set{border-color:var(--brand);background-color:var(--brand-l);font-weight:700;color:var(--brand-d)}
 .item .cat-b{display:inline-block;font-size:11px;font-weight:700;color:var(--brand);background:var(--brand-l);border-radius:6px;padding:1px 7px;margin-bottom:3px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
 .item .fname{font-size:14.5px;font-weight:500;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .item .of{font-size:12px;color:var(--ink-3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -317,6 +328,7 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
   <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="4" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="4" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="13" y="13" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
   <symbol id="i-logo" viewBox="0 0 32 32"><rect x="5" y="4" width="22" height="24" rx="3" fill="none" stroke="#0D47A1" stroke-width="2.6"/><path d="M10 11h12M10 16h12M10 21h7" stroke="#0D47A1" stroke-width="2.6" stroke-linecap="round"/><circle cx="23.5" cy="22.5" r="4.5" fill="#FF8F00"/></symbol>
 </svg>
 
@@ -339,11 +351,13 @@ mark{background:#FFE082;color:inherit;border-radius:3px;padding:0 1px}
     <div class="kind">
       <button id="kDrawing" onclick="setKind('drawing')">圖面</button>
       <button id="kFile" onclick="setKind('file')">檔案</button>
+      <button id="kFilter" class="kf" onclick="openFilter()"><svg width="16" height="16"><use href="#i-filter"/></svg>篩選<span class="kn hidden" id="kfN"></span></button>
     </div>
   </div>
 </header>
 
 <main class="home-body">
+  <div class="fchips hidden" id="fchips"></div>
   <section id="recentWrap" class="hidden">
     <div class="sec-t">最近看過</div>
     <div class="recent" id="recent"></div>
@@ -470,7 +484,7 @@ async function waitReady() {
 }
 
 /* ── 搜尋 / 清單 ── */
-const S = { q: '', page: 1, last: 1, loading: false, seq: 0, items: [], kind: 'drawing' };
+const S = { q: '', page: 1, last: 1, loading: false, seq: 0, items: [], kind: 'drawing', filters: {} };   // filters: 欄位ID -> { vid: 選項編號, text, label }
 try { S.kind = localStorage.getItem('zm_kind') === 'file' ? 'file' : 'drawing'; } catch (_) {}
 // 搜尋對象：圖面（圖號/品名）或 檔案（檔名，含所有分類的文件）
 function setKind(k, rerun = true) {
@@ -479,6 +493,7 @@ function setKind(k, rerun = true) {
   $('kDrawing').classList.toggle('on', k === 'drawing');
   $('kFile').classList.toggle('on', k === 'file');
   $('q').placeholder = k === 'file' ? '搜尋檔案名稱，例如 261021、報價' : '搜尋圖號、品名、關鍵字';
+  renderFilterUI();
   if (rerun) search($('q').value.trim());
 }
 setKind(S.kind, false);
@@ -500,6 +515,54 @@ function setMode(m) {
 let initMode = 'grid';
 try { initMode = localStorage.getItem('zm_mode') || 'grid'; } catch (_) {}
 setMode(initMode);
+
+/* ── 篩選（ZUMEN 圖面列表左側那 5 個下拉）── */
+let FOPT = null;   // [{ id, label, values: [{ text, id }] }]
+const filterList = () => Object.entries(S.filters).map(([id, f]) => ({ id, value: f.vid }));
+// 篩選只用在「圖面」搜尋；切到「檔案」時按鈕與已選條件都先隱藏（條件保留，切回來還在）
+function renderFilterUI() {
+  const isFile = S.kind === 'file', n = Object.keys(S.filters).length;
+  $('kFilter').classList.toggle('hidden', isFile);
+  $('kFilter').classList.toggle('has', n > 0);
+  $('kfN').textContent = n; $('kfN').classList.toggle('hidden', !n);
+  $('fchips').classList.toggle('hidden', isFile || !n);
+  $('fchips').innerHTML = Object.entries(S.filters).map(([id, f]) =>
+    `<div class="fchip"><small>${esc(f.label)}</small>${esc(f.text)}<button onclick="dropFilter('${id}')" aria-label="移除">${icon('x', 14)}</button></div>`).join('')
+    + (n > 1 ? '<button class="fchip clr" onclick="clearFilters()">全部清除</button>' : '');
+}
+function dropFilter(id) { delete S.filters[id]; search($('q').value.trim()); }
+function clearFilters() { S.filters = {}; search($('q').value.trim()); }
+async function openFilter() {
+  $('sheet').innerHTML = '<div class="grab"></div><h3>篩選</h3><div class="fempty"><span class="spin" style="display:inline-block"></span></div>';
+  pushOverlay('f');
+  $('scrim').classList.add('show'); $('sheet').classList.add('show');
+  try {
+    if (!FOPT) FOPT = (await api('/api/filter-options')).fields;
+  } catch (e) {
+    $('sheet').innerHTML = `<div class="grab"></div><h3>篩選</h3><div class="fempty" style="color:var(--red)">${esc(e.message)}</div><button class="bigbtn ghost" onclick="goBack()">關閉</button>`;
+    return;
+  }
+  const rows = FOPT.filter(f => f.values.length).map(f => {
+    const cur = S.filters[f.id]?.vid;
+    return `<div class="lbl">${esc(f.label)}</div><select class="txt ${cur ? 'set' : ''}" data-f="${f.id}" onchange="this.classList.toggle('set', !!this.value)">
+      <option value="">全部</option>${f.values.map(v => `<option value="${v.id}" ${v.id === cur ? 'selected' : ''}>${esc(v.text)}</option>`).join('')}</select>`;
+  }).join('');
+  $('sheet').innerHTML = `<div class="grab"></div><h3>篩選圖面</h3>
+    <div class="sub" style="font-family:inherit">可以同時選好幾項，結果是「全部都符合」的圖面</div>${rows}
+    <button class="bigbtn" onclick="applyFilter()">${icon('check', 20)}套用篩選</button>
+    <button class="bigbtn ghost" style="margin-top:10px" onclick="document.querySelectorAll('#sheet select').forEach(x => { x.value = ''; x.classList.remove('set'); })">清除全部選擇</button>`;
+}
+function applyFilter() {
+  const next = {};
+  document.querySelectorAll('#sheet select[data-f]').forEach(sel => {
+    if (!sel.value) return;
+    const fld = FOPT.find(f => f.id === sel.dataset.f);
+    next[fld.id] = { vid: Number(sel.value), text: fld.values.find(v => String(v.id) === sel.value).text, label: fld.label };
+  });
+  S.filters = next;
+  goBack();
+  search($('q').value.trim());
+}
 
 function skeleton(n = 6) {
   return Array.from({ length: n }, () => `<div class="item"><div class="thumb sk"></div><div class="info">
@@ -542,7 +605,8 @@ async function fetchPage(page) {
     const d = await api(`/api/files/search?page=${page}&q=${encodeURIComponent(S.q)}`);
     return { rows: d.files, last: d.last_page, total: 0 };
   }
-  const d = await api(`/api/drawings?page=${page}&q=${encodeURIComponent(S.q)}`);
+  const f = filterList();
+  const d = await api(`/api/drawings?page=${page}&q=${encodeURIComponent(S.q)}${f.length ? '&f=' + encodeURIComponent(JSON.stringify(f)) : ''}`);
   return { rows: d.drawings, last: d.last_page, total: d.total };
 }
 function rowsHtml(rows, offset) {
@@ -552,9 +616,11 @@ async function search(q) {
   const seq = ++S.seq;
   Object.assign(S, { q, page: 1, last: 1, items: [], loading: true });
   const isFile = S.kind === 'file';
-  $('listTitle').textContent = q ? `「${q}」的${isFile ? '檔案' : '圖面'}搜尋結果` : (isFile ? '檔案搜尋' : '最新更新');
+  const hasF = !isFile && filterList().length > 0;
+  $('listTitle').textContent = q ? `「${q}」的${isFile ? '檔案' : '圖面'}搜尋結果` : (isFile ? '檔案搜尋' : hasF ? '篩選結果' : '最新更新');
+  renderFilterUI();
   $('listCnt').textContent = '';
-  $('recentWrap').classList.toggle('hidden', !!q || !getRecent().length);
+  $('recentWrap').classList.toggle('hidden', !!q || hasF || !getRecent().length);
   $('more').textContent = '';
   if (isFile && !q) {
     S.loading = false;
@@ -568,7 +634,7 @@ async function search(q) {
     S.items = d.rows; S.last = d.last;
     $('listCnt').textContent = d.total ? `共 ${d.total} 筆` : '';
     if (!d.rows.length) {
-      $('list').innerHTML = `<div class="empty">${icon('search', 44)}<b>找不到符合的${isFile ? '檔案' : '圖面'}</b>${isFile ? '試試看檔名的一部分' : '試試看圖號的一部分'}，或換個關鍵字</div>`;
+      $('list').innerHTML = `<div class="empty">${icon('search', 44)}<b>找不到符合的${isFile ? '檔案' : '圖面'}</b>${isFile ? '試試看檔名的一部分，或換個關鍵字' : hasF ? '試試放寬篩選條件' + (q ? '，或換個關鍵字' : '') : '試試看圖號的一部分，或換個關鍵字'}</div>`;
     } else $('list').innerHTML = rowsHtml(d.rows, 0);
     updateMore();
   } catch (e) {
@@ -603,7 +669,7 @@ function pushRecent(d) {
 function renderRecent() {
   const r = getRecent();
   $('recent').innerHTML = r.map(x => `<button class="rchip" onclick="openDrawing(${x.id})"><b>${esc(x.drawing_number || '—')}</b><span>${esc(x.product_name || '')}</span></button>`).join('');
-  $('recentWrap').classList.toggle('hidden', !r.length || !!S.q);
+  $('recentWrap').classList.toggle('hidden', !r.length || !!S.q || filterList().length > 0 && S.kind !== 'file');
 }
 
 /* ── 路由：#d=ID 讓手機的「返回」鍵能正常關閉頁面 ── */
@@ -1065,7 +1131,7 @@ async function kickSender() {
 }
 let inflight = null;   // { abort, t0, reason }：目前送出中的請求
 // 版本標記：進度面板底下會顯示，電腦 log 也會帶，確認手機跑的是不是最新版（以前跑舊版而不知道）
-const BUILD = 'v8-1023';
+const BUILD = 'v9-1023';
 // 把手機端的錯誤原因送回電腦的 log（失敗時看不到手機 console，只能靠這個查）
 function reportErr(where, job, e) {
   try {
